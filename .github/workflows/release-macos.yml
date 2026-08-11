@@ -20,7 +20,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-13
+          # macos-13 Intel runners can remain queued for hours. The macos-14
+          # runner is available and supports PyInstaller's universal2 x86_64 target.
+          - runner: macos-14
             pyinstaller_arch: x86_64
             node_arch: x64
             asset_suffix: x64

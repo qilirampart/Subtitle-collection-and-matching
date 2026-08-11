@@ -1,0 +1,86 @@
+name: Release macOS Package
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing release tag, for example v2026.08.11.6
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13
+            pyinstaller_arch: x86_64
+            node_arch: x64
+            asset_suffix: x64
+          - runner: macos-14
+            pyinstaller_arch: arm64
+            node_arch: arm64
+            asset_suffix: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install build dependencies
+        run: pip install -r requirements.txt pyinstaller
+      - name: Download macOS runtime tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tools runtime/ffmpeg node-temp
+          curl -fL --retry 3 https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos -o tools/yt-dlp-nightly
+          curl -fL --retry 3 https://nodejs.org/dist/v20.18.0/node-v20.18.0-darwin-${{ matrix.node_arch }}.tar.gz -o node.tar.gz
+          tar -xzf node.tar.gz -C node-temp --strip-components=1
+          cp node-temp/bin/node tools/node
+          curl -fL --retry 3 https://evermeet.cx/ffmpeg/getrelease/zip -o ffmpeg.zip
+          curl -fL --retry 3 https://evermeet.cx/ffprobe/getrelease/zip -o ffprobe.zip
+          unzip -q ffmpeg.zip -d runtime/ffmpeg
+          unzip -q ffprobe.zip -d runtime/ffmpeg
+          chmod +x tools/yt-dlp-nightly tools/node runtime/ffmpeg/ffmpeg runtime/ffmpeg/ffprobe
+      - name: Prepare application icon
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p icon.iconset
+          for size in 16 32 128 256 512; do
+            sips -z "$size" "$size" app_icon.png --out "icon.iconset/icon_${size}x${size}.png" >/dev/null
+            double=$((size * 2))
+            sips -z "$double" "$double" app_icon.png --out "icon.iconset/icon_${size}x${size}@2x.png" >/dev/null
+          done
+          iconutil -c icns icon.iconset -o app_icon.icns
+      - name: Build DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_NAME='YouTube字幕核验助手'
+          python -m PyInstaller --noconfirm --clean --windowed --name "$APP_NAME" --target-architecture '${{ matrix.pyinstaller_arch }}' --icon app_icon.icns --distpath dist --workpath build --specpath . --add-data 'app_icon.ico:.' --add-data 'app_icon.png:.' --add-data 'asr_probe.mp3:.' --add-data 'tools:tools' --add-data 'runtime/ffmpeg:runtime/ffmpeg' main.py
+          hdiutil create -volname "$APP_NAME" -srcfolder "dist/$APP_NAME.app" -ov -format UDZO "YouTubeSubtitleVerifier-macOS-${{ matrix.asset_suffix }}.dmg"
+      - name: Upload macOS release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.version || github.ref_name }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 20); do
+            if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+              gh release upload "$RELEASE_TAG" "YouTubeSubtitleVerifier-macOS-${{ matrix.asset_suffix }}.dmg" --clobber
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "Windows release $RELEASE_TAG was not created in time." >&2
+          exit 1

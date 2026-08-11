@@ -7,7 +7,7 @@ from pathlib import Path
 from PySide6.QtCore import QTimer, QUrl, Qt, Signal
 from PySide6.QtWidgets import QDialog, QGridLayout, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
 
-from app.config.settings import EXTRACTED_AUDIO_DIR, FFMPEG_DIR
+from app.config.settings import EXTRACTED_AUDIO_DIR, FFMPEG_EXECUTABLE_PATH
 from app.utils.ffmpeg import _hidden_process_kwargs
 from app.utils.logger import get_logger
 from app.utils.paths import next_compact_name
@@ -164,7 +164,7 @@ class BrowserAudioCaptureDialog(QDialog):
             captured.write_bytes(base64.b64decode(data))
             restored = EXTRACTED_AUDIO_DIR / f"{next_compact_name('browser_audio')}.wav"
             subprocess.run(
-                [str(FFMPEG_DIR / "ffmpeg.exe"), "-y", "-i", str(captured), "-filter:a", "atempo=0.5,atempo=0.5,atempo=0.5", str(restored)],
+                [str(FFMPEG_EXECUTABLE_PATH), "-y", "-i", str(captured), "-filter:a", "atempo=0.5,atempo=0.5,atempo=0.5", str(restored)],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
                 **_hidden_process_kwargs(),
             )

@@ -5,6 +5,10 @@ import sys
 from pathlib import Path
 
 
+def _runtime_executable_name(name: str) -> str:
+    return f"{name}.exe" if sys.platform == "win32" else name
+
+
 def _resolve_resource_root() -> Path:
     if getattr(sys, "frozen", False):
         meipass = getattr(sys, "_MEIPASS", "")
@@ -16,6 +20,10 @@ def _resolve_resource_root() -> Path:
 
 def _resolve_app_root(resource_root: Path) -> Path:
     if getattr(sys, "frozen", False):
+        if sys.platform == "darwin":
+            # App bundles under /Applications are normally read-only. Keep user
+            # configuration, logs, and downloaded media outside the .app bundle.
+            return Path.home() / "Library" / "Application Support" / "Dianzhong" / "YouTube字幕核验助手"
         return Path(sys.executable).resolve().parent
     return resource_root
 
@@ -23,10 +31,10 @@ def _resolve_app_root(resource_root: Path) -> Path:
 def _resolve_ffmpeg_dir(resource_root: Path, app_root: Path) -> Path:
     """Prefer user-updatable tools next to the app, then packaged resources."""
     portable_dir = app_root / "runtime" / "ffmpeg"
-    if (portable_dir / "ffmpeg.exe").exists():
+    if (portable_dir / _runtime_executable_name("ffmpeg")).exists():
         return portable_dir
     bundled_dir = resource_root / "runtime" / "ffmpeg"
-    if (bundled_dir / "ffmpeg.exe").exists():
+    if (bundled_dir / _runtime_executable_name("ffmpeg")).exists():
         return bundled_dir
     return portable_dir
 
@@ -56,9 +64,11 @@ APP_ORGANIZATION = "Dianzhong"
 
 RUNTIME_DIR = APP_ROOT / "runtime"
 FFMPEG_DIR = _resolve_ffmpeg_dir(RESOURCE_ROOT, APP_ROOT)
+FFMPEG_EXECUTABLE_PATH = FFMPEG_DIR / _runtime_executable_name("ffmpeg")
+FFPROBE_EXECUTABLE_PATH = FFMPEG_DIR / _runtime_executable_name("ffprobe")
 YOUTUBE_COMPAT_TOOLS_DIR = RESOURCE_ROOT / "tools"
-YOUTUBE_COMPAT_YTDLP_PATH = YOUTUBE_COMPAT_TOOLS_DIR / "yt-dlp-nightly.exe"
-YOUTUBE_COMPAT_NODE_PATH = YOUTUBE_COMPAT_TOOLS_DIR / "node.exe"
+YOUTUBE_COMPAT_YTDLP_PATH = YOUTUBE_COMPAT_TOOLS_DIR / _runtime_executable_name("yt-dlp-nightly")
+YOUTUBE_COMPAT_NODE_PATH = YOUTUBE_COMPAT_TOOLS_DIR / _runtime_executable_name("node")
 OUTPUT_DIR = APP_ROOT / "output"
 DOWNLOAD_DIR = OUTPUT_DIR / "downloads"
 CLIP_OUTPUT_DIR = OUTPUT_DIR / "clips"

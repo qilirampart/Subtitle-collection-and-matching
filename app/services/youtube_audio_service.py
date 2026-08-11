@@ -18,6 +18,8 @@ import requests
 from app.config.settings import (
     EXTRACTED_AUDIO_DIR,
     FFMPEG_DIR,
+    FFMPEG_EXECUTABLE_PATH,
+    FFPROBE_EXECUTABLE_PATH,
     YOUTUBE_COMPAT_NODE_PATH,
     YOUTUBE_COMPAT_YTDLP_PATH,
 )
@@ -151,7 +153,7 @@ class YouTubeAudioService:
                 encoding="utf-8",
             )
             completed_process = subprocess.run(
-                [str(FFMPEG_DIR / "ffmpeg.exe"), "-y", "-f", "concat", "-safe", "0", "-i", str(concat_path), "-c", "copy", str(final_path)],
+                [str(FFMPEG_EXECUTABLE_PATH), "-y", "-f", "concat", "-safe", "0", "-i", str(concat_path), "-c", "copy", str(final_path)],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -477,7 +479,7 @@ class YouTubeAudioService:
 
     @staticmethod
     def _read_last_audio_timestamp(path: Path) -> float:
-        probe = FFMPEG_DIR / "ffprobe.exe"
+        probe = FFPROBE_EXECUTABLE_PATH
         if not probe.is_file():
             raise YouTubeServiceError("ffprobe is unavailable for direct audio validation.")
         completed_process = subprocess.run(
@@ -648,7 +650,7 @@ class YouTubeAudioService:
             )
             try:
                 completed_process = subprocess.run(
-                    [str(FFMPEG_DIR / "ffmpeg.exe"), "-y", "-f", "concat", "-safe", "0", "-i", str(concat_path), "-c", "copy", str(final_path)],
+                    [str(FFMPEG_EXECUTABLE_PATH), "-y", "-f", "concat", "-safe", "0", "-i", str(concat_path), "-c", "copy", str(final_path)],
                     capture_output=True,
                     text=True,
                     encoding="utf-8",

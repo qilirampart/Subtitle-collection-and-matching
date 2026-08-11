@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import queue
 import shutil
@@ -16,9 +15,9 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 
 
-RELEASE_API_URL = (
-    "https://api.github.com/repos/qilirampart/"
-    "Subtitle-collection-and-matching/releases/latest"
+RELEASE_DOWNLOAD_BASE_URL = (
+    "https://github.com/qilirampart/"
+    "Subtitle-collection-and-matching/releases/latest/download"
 )
 APP_DIRECTORY_NAME = "YouTube字幕核验助手"
 APP_EXECUTABLE_NAME = "YouTube字幕核验助手.exe"
@@ -110,31 +109,20 @@ class OnlineInstaller(tk.Tk):
 
     @staticmethod
     def _load_release_manifest() -> dict[str, object]:
-        request = urllib.request.Request(RELEASE_API_URL, headers={"User-Agent": "SubtitleVerifierInstaller"})
+        # GitHub API has a low anonymous rate limit. The stable latest-download URL
+        # redirects to the newest release asset without consuming that API quota.
+        archive_url = f"{RELEASE_DOWNLOAD_BASE_URL}/{ARCHIVE_NAME}"
+        hash_url = f"{RELEASE_DOWNLOAD_BASE_URL}/{HASH_NAME}"
+        request = urllib.request.Request(hash_url, headers={"User-Agent": "SubtitleVerifierInstaller"})
         with urllib.request.urlopen(request, timeout=20) as response:
-            release = json.loads(response.read().decode("utf-8"))
-        assets = release.get("assets") if isinstance(release, dict) else []
-        if not isinstance(assets, list):
-            raise RuntimeError("GitHub 发布版本信息格式无效。")
-        asset_urls = {
-            str(asset.get("name") or ""): str(asset.get("browser_download_url") or "")
-            for asset in assets
-            if isinstance(asset, dict)
-        }
-        archive_url = asset_urls.get(ARCHIVE_NAME, "")
-        hash_url = asset_urls.get(HASH_NAME, "")
-        if not archive_url or not hash_url:
-            raise RuntimeError("最新发布版本缺少 Windows 安装组件。")
-        with urllib.request.urlopen(hash_url, timeout=20) as response:
             hash_text = response.read().decode("utf-8").strip()
         expected_hash = hash_text.split()[0].lower() if hash_text else ""
+        if len(expected_hash) != 64:
+            raise RuntimeError("最新发布版本缺少完整性校验文件。")
         payload = {
             "download_url": archive_url,
             "sha256": expected_hash,
-            "size_bytes": next(
-                (int(asset.get("size") or 0) for asset in assets if isinstance(asset, dict) and asset.get("name") == ARCHIVE_NAME),
-                0,
-            ),
+            "size_bytes": 0,
             "archive_name": ARCHIVE_NAME,
         }
         if not isinstance(payload, dict):

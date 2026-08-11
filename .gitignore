@@ -6,3 +6,5 @@ output/
 build/
 release/
 tools/*.exe
+installer/build/
+installer/dist/

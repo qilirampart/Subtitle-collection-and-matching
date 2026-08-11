@@ -45,7 +45,7 @@ class OnlineInstaller(tk.Tk):
         super().__init__()
         self.title("YouTube 字幕核验助手 安装器")
         self.resizable(False, False)
-        self.geometry("660x330")
+        self.geometry("720x390")
         self._events: queue.Queue[tuple[str, object]] = queue.Queue()
         self._installing = False
 
@@ -55,20 +55,20 @@ class OnlineInstaller(tk.Tk):
         style.configure("TEntry", font=("Microsoft YaHei UI", 10))
         style.configure("TButton", font=("Microsoft YaHei UI", 10), padding=(10, 5))
 
-        preferred_root = Path("D:/Dianzhong")
-        default_root = preferred_root if preferred_root.exists() else Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Dianzhong"
+        preferred_drive = Path("D:/")
+        default_root = preferred_drive / "Dianzhong" if preferred_drive.is_dir() else Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Dianzhong"
         self.install_path = tk.StringVar(value=str(default_root / APP_DIRECTORY_NAME))
         self.status_text = tk.StringVar(value="准备安装。安装器会自动下载并校验所需组件。")
         self.progress_text = tk.StringVar(value="等待开始")
 
-        body = ttk.Frame(self, padding=24)
+        body = ttk.Frame(self, padding=20)
         body.pack(fill=tk.BOTH, expand=True)
         ttk.Label(body, text="YouTube 字幕核验助手", font=("Microsoft YaHei UI", 16, "bold")).pack(anchor=tk.W)
         ttk.Label(
             body,
             text="在线安装器会自动下载完整运行组件，无需手动配置 FFmpeg、Node 或浏览器依赖。",
-            wraplength=610,
-        ).pack(anchor=tk.W, pady=(8, 16))
+            wraplength=670,
+        ).pack(anchor=tk.W, pady=(6, 12))
 
         location = ttk.Frame(body)
         location.pack(fill=tk.X)
@@ -78,13 +78,13 @@ class OnlineInstaller(tk.Tk):
         ttk.Entry(row, textvariable=self.install_path).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(row, text="选择...", command=self._choose_directory).pack(side=tk.LEFT, padx=(8, 0))
 
-        ttk.Label(body, textvariable=self.status_text, wraplength=610).pack(anchor=tk.W, pady=(18, 6))
+        ttk.Label(body, textvariable=self.status_text, wraplength=670).pack(anchor=tk.W, pady=(12, 5))
         self.progress = ttk.Progressbar(body, mode="determinate", maximum=100)
         self.progress.pack(fill=tk.X)
         ttk.Label(body, textvariable=self.progress_text).pack(anchor=tk.E, pady=(4, 0))
 
         actions = ttk.Frame(body)
-        actions.pack(fill=tk.X, pady=(18, 0))
+        actions.pack(fill=tk.X, pady=(12, 0))
         self.install_button = ttk.Button(actions, text="开始安装", command=self._start_install)
         self.install_button.pack(side=tk.RIGHT)
         ttk.Button(actions, text="取消", command=self.destroy).pack(side=tk.RIGHT, padx=(0, 8))

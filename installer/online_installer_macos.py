@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import platform
 import plistlib
 import queue
 import shlex
-import shutil
 import subprocess
 import tempfile
 import threading
@@ -30,13 +28,14 @@ class MacOnlineInstaller(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"{APP_NAME} 安装器")
-        self.resizable(False, False)
-        self.geometry("640x310")
+        self.minsize(680, 360)
+        self.geometry("700x370")
+        self.resizable(True, True)
         self._events: queue.Queue[tuple[str, object]] = queue.Queue()
         self._installing = False
         self._architecture = self._detect_architecture()
 
-        body = ttk.Frame(self, padding=22)
+        body = ttk.Frame(self, padding=24)
         body.pack(fill=tk.BOTH, expand=True)
         ttk.Label(body, text=APP_NAME, font=("PingFang SC", 16, "bold")).pack(anchor=tk.W)
         ttk.Label(
@@ -45,17 +44,17 @@ class MacOnlineInstaller(tk.Tk):
                 f"将自动下载适用于 {self._architecture_label()} 的完整组件，"
                 "校验后安装到“应用程序”目录。"
             ),
-            wraplength=580,
+            wraplength=640,
         ).pack(anchor=tk.W, pady=(8, 16))
         ttk.Label(
             body,
             text="安装过程中 macOS 会请求管理员确认，用于复制应用程序。",
-            wraplength=580,
+            wraplength=640,
         ).pack(anchor=tk.W)
 
         self.status_text = tk.StringVar(value="准备安装。")
         self.progress_text = tk.StringVar(value="等待开始")
-        ttk.Label(body, textvariable=self.status_text, wraplength=580).pack(anchor=tk.W, pady=(18, 6))
+        ttk.Label(body, textvariable=self.status_text, wraplength=640).pack(anchor=tk.W, pady=(16, 6))
         self.progress = ttk.Progressbar(body, mode="determinate", maximum=100)
         self.progress.pack(fill=tk.X)
         ttk.Label(body, textvariable=self.progress_text).pack(anchor=tk.E, pady=(4, 0))
@@ -73,6 +72,16 @@ class MacOnlineInstaller(tk.Tk):
         if machine in {"arm64", "aarch64"}:
             return "arm64"
         if machine in {"x86_64", "amd64"}:
+            # An x64 installer can be opened through Rosetta on Apple Silicon.
+            # Prefer the native app bundle instead of propagating that emulation.
+            translated = subprocess.run(
+                ["sysctl", "-in", "sysctl.proc_translated"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if translated.returncode == 0 and translated.stdout.strip() == "1":
+                return "arm64"
             return "x64"
         raise RuntimeError(f"不支持的 Mac 芯片架构：{machine or 'unknown'}")
 
@@ -212,7 +221,7 @@ class MacOnlineInstaller(tk.Tk):
                     self._installing = False
                     self.install_button.configure(state=tk.NORMAL)
                     if messagebox.askyesno("安装完成", f"{APP_NAME} 已安装完成。是否立即启动？"):
-                        subprocess.Popen(["open", "-a", APP_NAME])
+                        subprocess.Popen(["open", f"/Applications/{APP_NAME}.app"])
                 elif kind == "error":
                     self._installing = False
                     self.install_button.configure(state=tk.NORMAL)

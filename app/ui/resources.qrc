@@ -1,0 +1,6 @@
+<RCC>
+  <qresource prefix="/ui/icons">
+    <file>icons/chevron-down.svg</file>
+    <file>icons/chevron-up.svg</file>
+  </qresource>
+</RCC>

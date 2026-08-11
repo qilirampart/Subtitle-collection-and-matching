@@ -46,10 +46,12 @@ jobs:
           tar -xzf node.tar.gz -C node-temp --strip-components=1
           cp node-temp/bin/node tools/node
           curl -fL --retry 3 https://evermeet.cx/ffmpeg/getrelease/zip -o ffmpeg.zip
-          curl -fL --retry 3 https://evermeet.cx/ffprobe/getrelease/zip -o ffprobe.zip
+          curl -fL --retry 3 https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip -o ffprobe.zip
           unzip -q ffmpeg.zip -d runtime/ffmpeg
           unzip -q ffprobe.zip -d runtime/ffmpeg
           chmod +x tools/yt-dlp-nightly tools/node runtime/ffmpeg/ffmpeg runtime/ffmpeg/ffprobe
+          runtime/ffmpeg/ffmpeg -version
+          runtime/ffmpeg/ffprobe -version
       - name: Prepare application icon
         shell: bash
         run: |

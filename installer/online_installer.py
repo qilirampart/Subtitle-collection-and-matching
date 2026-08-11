@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import os
 import queue
@@ -25,27 +26,48 @@ ARCHIVE_NAME = "YouTubeSubtitleVerifier-Windows-x64.zip"
 HASH_NAME = f"{ARCHIVE_NAME}.sha256"
 
 
+def _enable_windows_dpi_awareness() -> None:
+    """Prevent Tk widgets from being bitmap-scaled with misaligned text."""
+    if sys.platform != "win32":
+        return
+    try:
+        # Per-monitor V2 keeps Tk text and native ttk controls on one DPI scale.
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            pass
+
+
 class OnlineInstaller(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("YouTube 字幕核验助手 安装器")
         self.resizable(False, False)
-        self.geometry("620x300")
+        self.geometry("660x330")
         self._events: queue.Queue[tuple[str, object]] = queue.Queue()
         self._installing = False
 
-        default_root = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Dianzhong"
+        style = ttk.Style(self)
+        style.configure(".", font=("Microsoft YaHei UI", 10))
+        style.configure("TLabel", font=("Microsoft YaHei UI", 10))
+        style.configure("TEntry", font=("Microsoft YaHei UI", 10))
+        style.configure("TButton", font=("Microsoft YaHei UI", 10), padding=(10, 5))
+
+        preferred_root = Path("D:/Dianzhong")
+        default_root = preferred_root if preferred_root.exists() else Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Dianzhong"
         self.install_path = tk.StringVar(value=str(default_root / APP_DIRECTORY_NAME))
         self.status_text = tk.StringVar(value="准备安装。安装器会自动下载并校验所需组件。")
         self.progress_text = tk.StringVar(value="等待开始")
 
-        body = ttk.Frame(self, padding=22)
+        body = ttk.Frame(self, padding=24)
         body.pack(fill=tk.BOTH, expand=True)
         ttk.Label(body, text="YouTube 字幕核验助手", font=("Microsoft YaHei UI", 16, "bold")).pack(anchor=tk.W)
         ttk.Label(
             body,
             text="在线安装器会自动下载完整运行组件，无需手动配置 FFmpeg、Node 或浏览器依赖。",
-            wraplength=560,
+            wraplength=610,
         ).pack(anchor=tk.W, pady=(8, 16))
 
         location = ttk.Frame(body)
@@ -56,7 +78,7 @@ class OnlineInstaller(tk.Tk):
         ttk.Entry(row, textvariable=self.install_path).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(row, text="选择...", command=self._choose_directory).pack(side=tk.LEFT, padx=(8, 0))
 
-        ttk.Label(body, textvariable=self.status_text, wraplength=560).pack(anchor=tk.W, pady=(18, 6))
+        ttk.Label(body, textvariable=self.status_text, wraplength=610).pack(anchor=tk.W, pady=(18, 6))
         self.progress = ttk.Progressbar(body, mode="determinate", maximum=100)
         self.progress.pack(fill=tk.X)
         ttk.Label(body, textvariable=self.progress_text).pack(anchor=tk.E, pady=(4, 0))
@@ -242,4 +264,5 @@ class OnlineInstaller(tk.Tk):
 
 
 if __name__ == "__main__":
+    _enable_windows_dpi_awareness()
     OnlineInstaller().mainloop()

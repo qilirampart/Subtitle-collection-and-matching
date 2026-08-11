@@ -203,7 +203,9 @@ class OnlineInstaller(tk.Tk):
                 'link.Save\n'
             )
             script_path = target / ".create_shortcut.vbs"
-            script_path.write_text(script, encoding="utf-8")
+            # Windows Script Host reliably recognizes UTF-16 with BOM. UTF-8 without
+            # BOM causes Chinese shortcut names to be decoded using the ANSI code page.
+            script_path.write_text(script, encoding="utf-16")
             subprocess.run(["cscript.exe", "//nologo", str(script_path)], check=True, capture_output=True)
             script_path.unlink(missing_ok=True)
 

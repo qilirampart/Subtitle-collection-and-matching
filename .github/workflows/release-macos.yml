@@ -65,13 +65,17 @@ jobs:
             sips -z "$double" "$double" app_icon.png --out "icon.iconset/icon_${size}x${size}@2x.png" >/dev/null
           done
           iconutil -c icns icon.iconset -o app_icon.icns
-      - name: Build DMG
+      - name: Build application and online installer DMGs
         shell: bash
         run: |
           set -euo pipefail
           APP_NAME='YouTube字幕核验助手'
+          INSTALLER_NAME='YouTube字幕核验助手安装器'
           python -m PyInstaller --noconfirm --clean --windowed --name "$APP_NAME" --target-architecture '${{ matrix.pyinstaller_arch }}' --icon app_icon.icns --distpath dist --workpath build --specpath . --add-data 'app_icon.ico:.' --add-data 'app_icon.png:.' --add-data 'asr_probe.mp3:.' --add-data 'tools:tools' --add-data 'runtime/ffmpeg:runtime/ffmpeg' main.py
           hdiutil create -volname "$APP_NAME" -srcfolder "dist/$APP_NAME.app" -ov -format UDZO "YouTubeSubtitleVerifier-macOS-${{ matrix.asset_suffix }}.dmg"
+          shasum -a 256 "YouTubeSubtitleVerifier-macOS-${{ matrix.asset_suffix }}.dmg" > "YouTubeSubtitleVerifier-macOS-${{ matrix.asset_suffix }}.dmg.sha256"
+          python -m PyInstaller --noconfirm --clean --windowed --name "$INSTALLER_NAME" --target-architecture '${{ matrix.pyinstaller_arch }}' --icon app_icon.icns --distpath installer-dist --workpath installer-build --specpath . installer/online_installer_macos.py
+          hdiutil create -volname "$INSTALLER_NAME" -srcfolder "installer-dist/$INSTALLER_NAME.app" -ov -format UDZO "YouTubeSubtitleVerifier-OnlineInstaller-macOS-${{ matrix.asset_suffix }}.dmg"
       - name: Upload macOS release asset
         shell: bash
         env:
@@ -81,7 +85,7 @@ jobs:
           set -euo pipefail
           for attempt in $(seq 1 20); do
             if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-              gh release upload "$RELEASE_TAG" "YouTubeSubtitleVerifier-macOS-${{ matrix.asset_suffix }}.dmg" --clobber
+              gh release upload "$RELEASE_TAG" "YouTubeSubtitleVerifier-macOS-${{ matrix.asset_suffix }}.dmg" "YouTubeSubtitleVerifier-macOS-${{ matrix.asset_suffix }}.dmg.sha256" "YouTubeSubtitleVerifier-OnlineInstaller-macOS-${{ matrix.asset_suffix }}.dmg" --clobber
               exit 0
             fi
             sleep 20

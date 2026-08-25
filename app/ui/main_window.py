@@ -1586,11 +1586,11 @@ class MainWindow(QMainWindow):
         self._update_check_thread = thread
         thread.completed.connect(self._on_update_check_completed)
         thread.failed.connect(self._on_update_check_failed)
+        thread.finished.connect(self._finish_update_check_thread)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
     def _on_update_check_completed(self, update: AvailableUpdate | None) -> None:
-        self._update_check_thread = None
         self.update_button.setEnabled(True)
         if update is None:
             self.status_label.setText(f"当前已是最新版本（{APP_VERSION}）。")
@@ -1618,7 +1618,6 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"已取消更新到 {update.version}。")
 
     def _on_update_check_failed(self, message: str) -> None:
-        self._update_check_thread = None
         self.update_button.setEnabled(True)
         self.status_label.setText("检查更新失败。")
         QMessageBox.warning(self, "检查更新失败", message)
@@ -1639,6 +1638,7 @@ class MainWindow(QMainWindow):
         thread.progress.connect(self._on_update_download_progress)
         thread.completed.connect(self._on_update_download_completed)
         thread.failed.connect(self._on_update_download_failed)
+        thread.finished.connect(self._finish_update_download_thread)
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
@@ -1661,8 +1661,13 @@ class MainWindow(QMainWindow):
             dialog.close()
             dialog.deleteLater()
 
-    def _on_update_download_completed(self, archive: Path) -> None:
+    def _finish_update_check_thread(self) -> None:
+        self._update_check_thread = None
+
+    def _finish_update_download_thread(self) -> None:
         self._update_download_thread = None
+
+    def _on_update_download_completed(self, archive: Path) -> None:
         self._close_update_progress_dialog()
         try:
             self._launch_updater(Path(archive))
@@ -1672,7 +1677,6 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "更新失败", str(exc))
 
     def _on_update_download_failed(self, message: str) -> None:
-        self._update_download_thread = None
         self._close_update_progress_dialog()
         self.update_button.setEnabled(True)
         self.status_label.setText("更新下载或校验失败。")

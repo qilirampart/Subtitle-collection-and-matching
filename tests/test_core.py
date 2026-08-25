@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 from time import sleep
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
+from urllib.error import HTTPError
 from zipfile import ZipFile
 
 from openpyxl import load_workbook
@@ -94,6 +95,14 @@ class UpdateServiceTests(unittest.TestCase):
     def test_rejects_incomplete_update_asset(self) -> None:
         with self.assertRaises(UpdateError):
             ApplicationUpdateService._asset_for_platform({"windows": {"url": "https://example/app.zip"}}, "windows", "x64")
+
+    def test_reports_unpublished_update_manifest_clearly(self) -> None:
+        service = ApplicationUpdateService("https://example.invalid/update.json")
+        with patch(
+            "app.services.update_service.urllib.request.urlopen",
+            side_effect=HTTPError(service.manifest_url, 404, "Not Found", None, None),
+        ), self.assertRaisesRegex(UpdateError, "更新服务尚未发布"):
+            service.check_for_update("2026.08.25.1")
 
     def test_windows_updater_replaces_program_and_preserves_user_data(self) -> None:
         with TemporaryDirectory() as directory:

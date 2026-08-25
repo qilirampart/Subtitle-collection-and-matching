@@ -6,6 +6,7 @@ import platform
 import re
 import tempfile
 import urllib.request
+from urllib.error import HTTPError
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -117,8 +118,14 @@ class ApplicationUpdateService:
         try:
             with urllib.request.urlopen(request, timeout=20) as response:
                 payload = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            if exc.code == 404:
+                raise UpdateError(
+                    "更新服务尚未发布。请先安装包含更新功能的最新完整版本，或在发布完成后重试。"
+                ) from exc
+            raise UpdateError(f"无法读取更新信息（HTTP {exc.code}）。请检查网络后重试。") from exc
         except (OSError, ValueError, json.JSONDecodeError) as exc:
-            raise UpdateError(f"Unable to read update metadata: {exc}") from exc
+            raise UpdateError(f"无法读取更新信息，请检查网络后重试：{exc}") from exc
         if not isinstance(payload, dict) or int(payload.get("schema_version") or 0) != 1:
             raise UpdateError("Update metadata format is invalid.")
         return payload

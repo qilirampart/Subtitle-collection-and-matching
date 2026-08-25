@@ -5,6 +5,7 @@ import json
 import platform
 import re
 import tempfile
+import time
 import urllib.request
 from urllib.error import HTTPError
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Callable
 
 from app.version import UPDATE_MANIFEST_URL
+from app.config.settings import YOUTUBE_PROXY_CONFIG_PATH
 
 
 class UpdateError(RuntimeError):
@@ -114,10 +116,8 @@ class ApplicationUpdateService:
             raise
 
     def _load_manifest(self) -> dict[str, object]:
-        request = urllib.request.Request(self.manifest_url, headers={"User-Agent": "YouTubeSubtitleVerifier"})
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+            payload = json.loads(self._request_bytes(self.manifest_url, timeout=20).decode("utf-8"))
         except HTTPError as exc:
             if exc.code == 404:
                 raise UpdateError(
@@ -147,23 +147,18 @@ class ApplicationUpdateService:
             size_bytes = 0
         return UpdateAsset(url, sha256_url, file_name, size_bytes)
 
-    @staticmethod
-    def _read_sha256(url: str) -> str:
-        request = urllib.request.Request(url, headers={"User-Agent": "YouTubeSubtitleVerifier"})
+    def _read_sha256(self, url: str) -> str:
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
-                value = response.read().decode("utf-8").strip().split(maxsplit=1)[0].lower()
+            value = self._request_bytes(url, timeout=20).decode("utf-8").strip().split(maxsplit=1)[0].lower()
         except OSError as exc:
             raise UpdateError(f"Unable to download update verification file: {exc}") from exc
         if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
             raise UpdateError("Update verification file is invalid.")
         return value
 
-    @staticmethod
-    def _download(url: str, target: Path, expected_size: int, callback: ProgressCallback | None) -> None:
-        request = urllib.request.Request(url, headers={"User-Agent": "YouTubeSubtitleVerifier"})
+    def _download(self, url: str, target: Path, expected_size: int, callback: ProgressCallback | None) -> None:
         try:
-            with urllib.request.urlopen(request, timeout=60) as response, target.open("wb") as output:
+            with self._open_request(url, timeout=60) as response, target.open("wb") as output:
                 total = int(response.headers.get("Content-Length") or expected_size or 0)
                 received = 0
                 while True:
@@ -176,6 +171,49 @@ class ApplicationUpdateService:
                         callback(received, total)
         except OSError as exc:
             raise UpdateError(f"Unable to download update package: {exc}") from exc
+
+    def _request_bytes(self, url: str, *, timeout: int) -> bytes:
+        last_error: OSError | None = None
+        for attempt in range(1, 4):
+            try:
+                with self._open_request(url, timeout=timeout) as response:
+                    return response.read()
+            except HTTPError:
+                raise
+            except OSError as exc:
+                last_error = exc
+                if attempt < 3:
+                    time.sleep(attempt)
+        if last_error is not None:
+            raise last_error
+        raise UpdateError("Unable to read update information.")
+
+    @staticmethod
+    def _configured_proxy() -> str:
+        try:
+            value = YOUTUBE_PROXY_CONFIG_PATH.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+        if value and not value.lower().startswith(("http://", "https://")):
+            return ""
+        return value
+
+    def _open_request(self, url: str, *, timeout: int):
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "YouTubeSubtitleVerifier",
+                # Avoid reusing a proxy connection that GitHub or the local
+                # proxy service has already closed during a previous request.
+                "Connection": "close",
+            },
+        )
+        proxy = self._configured_proxy()
+        if proxy:
+            return urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            ).open(request, timeout=timeout)
+        return urllib.request.urlopen(request, timeout=timeout)
 
     @staticmethod
     def sha256(path: Path) -> str:

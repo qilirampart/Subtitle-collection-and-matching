@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 from urllib.error import HTTPError
 from zipfile import ZipFile
+from io import BytesIO
 
 from openpyxl import load_workbook
 
@@ -101,8 +102,21 @@ class UpdateServiceTests(unittest.TestCase):
         with patch(
             "app.services.update_service.urllib.request.urlopen",
             side_effect=HTTPError(service.manifest_url, 404, "Not Found", None, None),
+        ), patch.object(
+            ApplicationUpdateService, "_configured_proxy", return_value=""
         ), self.assertRaisesRegex(UpdateError, "更新服务尚未发布"):
             service.check_for_update("2026.08.25.1")
+
+    def test_retries_transient_update_metadata_connection_errors(self) -> None:
+        service = ApplicationUpdateService("https://example.invalid/update.json")
+        with patch(
+            "app.services.update_service.urllib.request.urlopen",
+            side_effect=[OSError("TLS connection closed"), OSError("TLS connection closed"), BytesIO(b"ok")],
+        ) as urlopen, patch.object(
+            ApplicationUpdateService, "_configured_proxy", return_value=""
+        ), patch("app.services.update_service.time.sleep"):
+            self.assertEqual(service._request_bytes(service.manifest_url, timeout=1), b"ok")
+        self.assertEqual(urlopen.call_count, 3)
 
     def test_windows_updater_replaces_program_and_preserves_user_data(self) -> None:
         with TemporaryDirectory() as directory:

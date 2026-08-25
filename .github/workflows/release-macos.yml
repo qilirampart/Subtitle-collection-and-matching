@@ -38,6 +38,11 @@ jobs:
           python-version: '3.11'
       - name: Install build dependencies
         run: pip install -r requirements.txt pyinstaller
+      - name: Verify release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ inputs.version || github.ref_name }}" = "v$(python -c 'from app.version import APP_VERSION; print(APP_VERSION)')"
       - name: Download macOS runtime tools
         shell: bash
         run: |
@@ -72,6 +77,9 @@ jobs:
           APP_NAME='YouTube字幕核验助手'
           INSTALLER_NAME='YouTube字幕核验助手安装器'
           python -m PyInstaller --noconfirm --clean --windowed --name "$APP_NAME" --target-architecture '${{ matrix.pyinstaller_arch }}' --icon app_icon.icns --distpath dist --workpath build --specpath . --add-data 'app_icon.ico:.' --add-data 'app_icon.png:.' --add-data 'asr_probe.mp3:.' --add-data 'tools:tools' --add-data 'runtime/ffmpeg:runtime/ffmpeg' main.py
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name 'YouTubeSubtitleVerifier-Updater' --target-architecture '${{ matrix.pyinstaller_arch }}' --distpath updater-dist --workpath updater-build --specpath . updater/app_updater.py
+          cp 'updater-dist/YouTubeSubtitleVerifier-Updater' "dist/$APP_NAME.app/Contents/MacOS/YouTubeSubtitleVerifier-Updater"
+          chmod +x "dist/$APP_NAME.app/Contents/MacOS/YouTubeSubtitleVerifier-Updater"
           hdiutil create -volname "$APP_NAME" -srcfolder "dist/$APP_NAME.app" -ov -format UDZO "YouTubeSubtitleVerifier-macOS-${{ matrix.asset_suffix }}.dmg"
           shasum -a 256 "YouTubeSubtitleVerifier-macOS-${{ matrix.asset_suffix }}.dmg" > "YouTubeSubtitleVerifier-macOS-${{ matrix.asset_suffix }}.dmg.sha256"
           python -m PyInstaller --noconfirm --clean --windowed --name "$INSTALLER_NAME" --target-architecture '${{ matrix.pyinstaller_arch }}' --icon app_icon.icns --distpath installer-dist --workpath installer-build --specpath . installer/online_installer_macos.py

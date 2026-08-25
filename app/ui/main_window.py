@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
 from threading import Lock, local
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +33,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QProgressDialog,
     QProgressBar,
     QScrollArea,
     QSpinBox,
@@ -58,6 +64,7 @@ from app.services.review_excel_exporter import (
 )
 from app.services.proxy_discovery_service import ProxyDiscoveryService
 from app.services.api_config_service import ApiConfigService
+from app.services.update_service import ApplicationUpdateService, AvailableUpdate
 from app.services.youtube_audio_service import YouTubeAudioService
 from app.services.youtube_service import YouTubeDownloadCancelled, YouTubeService
 from app.services.youtube_asr import YouTubeAsrService
@@ -82,6 +89,7 @@ from app.ui.workspace_pages import (
 )
 from app.task_control import TaskControl
 from app.utils.logger import get_logger
+from app.version import APP_VERSION
 
 
 LOGGER = get_logger(__name__)
@@ -174,6 +182,37 @@ class _CollectThread(QThread):
     def run(self) -> None:
         try:
             self.succeeded.emit(VerificationWorkflow().collector.collect_channel(self.url, max_items=self.limit))
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
+class _UpdateCheckThread(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def run(self) -> None:
+        try:
+            self.completed.emit(ApplicationUpdateService().check_for_update(APP_VERSION))
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
+class _UpdateDownloadThread(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+    progress = Signal(int, int)
+
+    def __init__(self, update: AvailableUpdate) -> None:
+        super().__init__()
+        self.update = update
+
+    def run(self) -> None:
+        try:
+            archive = ApplicationUpdateService().download_update(
+                self.update,
+                progress_callback=lambda received, total: self.progress.emit(received, total),
+            )
+            self.completed.emit(archive)
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
 
@@ -836,6 +875,9 @@ class MainWindow(QMainWindow):
         self._asr_config_dialog: AsrConfigDialog | None = None
         self._llm_config_dialog: LlmConfigDialog | None = None
         self._matching_config_dialog: MatchingConfigDialog | None = None
+        self._update_check_thread: _UpdateCheckThread | None = None
+        self._update_download_thread: _UpdateDownloadThread | None = None
+        self._update_progress_dialog: QProgressDialog | None = None
         self._api_config_service = ApiConfigService()
         self._standalone_download_results: list[dict[str, object]] = []
         self._state_store = TaskStateStore()
@@ -892,6 +934,9 @@ class MainWindow(QMainWindow):
         self.matching_config_button.clicked.connect(self._open_matching_config)
         self.youtube_login_button = QPushButton("YouTube 登录")
         self.youtube_login_button.clicked.connect(self._open_youtube_login)
+        self.update_button = QPushButton("检查更新")
+        self.update_button.clicked.connect(self._check_for_updates)
+        self.update_button.setToolTip(f"当前版本：{APP_VERSION}")
         self.clear_button = QPushButton("清空任务")
         self.clear_button.clicked.connect(self._clear)
         self.export_button.setProperty("secondary", True)
@@ -901,6 +946,7 @@ class MainWindow(QMainWindow):
         self.asr_config_button.setProperty("secondary", True)
         self.llm_config_button.setProperty("secondary", True)
         self.matching_config_button.setProperty("secondary", True)
+        self.update_button.setProperty("secondary", True)
         self.clear_button.setProperty("danger", True)
         top_main_row.addWidget(self.clear_button)
         self._top_tools_layout = QGridLayout()
@@ -915,6 +961,7 @@ class MainWindow(QMainWindow):
             self.llm_config_button,
             self.matching_config_button,
             self.youtube_login_button,
+            self.update_button,
         )
         top_layout.addLayout(top_main_row)
         top_layout.addLayout(self._top_tools_layout)
@@ -1528,6 +1575,147 @@ class MainWindow(QMainWindow):
             self._parallel_cover_review_thread = None
             self._parallel_cover_review_control = None
             return False
+
+    def _check_for_updates(self) -> None:
+        if self._update_check_thread is not None and self._update_check_thread.isRunning():
+            return
+        self.update_button.setEnabled(False)
+        self.status_label.setText("正在检查软件更新...")
+        thread = _UpdateCheckThread()
+        self._update_check_thread = thread
+        thread.completed.connect(self._on_update_check_completed)
+        thread.failed.connect(self._on_update_check_failed)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _on_update_check_completed(self, update: AvailableUpdate | None) -> None:
+        self._update_check_thread = None
+        self.update_button.setEnabled(True)
+        if update is None:
+            self.status_label.setText(f"当前已是最新版本（{APP_VERSION}）。")
+            QMessageBox.information(self, "检查更新", f"当前已是最新版本：{APP_VERSION}")
+            return
+        size_text = "大小将在下载时显示"
+        if update.asset.size_bytes:
+            size_text = f"约 {update.asset.size_bytes / 1_048_576:.0f} MB"
+        message = (
+            f"发现新版本：{update.version}\n"
+            f"当前版本：{APP_VERSION}\n"
+            f"更新包：{size_text}\n\n"
+            "下载完成并校验后将自动更新和重启。runtime、output 中的配置与任务数据会保留。"
+        )
+        answer = QMessageBox.question(
+            self,
+            "发现新版本",
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._download_update(update)
+        else:
+            self.status_label.setText(f"已取消更新到 {update.version}。")
+
+    def _on_update_check_failed(self, message: str) -> None:
+        self._update_check_thread = None
+        self.update_button.setEnabled(True)
+        self.status_label.setText("检查更新失败。")
+        QMessageBox.warning(self, "检查更新失败", message)
+
+    def _download_update(self, update: AvailableUpdate) -> None:
+        self.update_button.setEnabled(False)
+        dialog = QProgressDialog("正在下载并校验更新包...", "", 0, 0, self)
+        dialog.setWindowTitle("正在更新")
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setCancelButton(None)
+        dialog.setMinimumDuration(0)
+        dialog.show()
+        self._update_progress_dialog = dialog
+        thread = _UpdateDownloadThread(update)
+        self._update_download_thread = thread
+        thread.progress.connect(self._on_update_download_progress)
+        thread.completed.connect(self._on_update_download_completed)
+        thread.failed.connect(self._on_update_download_failed)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _on_update_download_progress(self, received: int, total: int) -> None:
+        dialog = self._update_progress_dialog
+        if dialog is None:
+            return
+        if total > 0:
+            dialog.setRange(0, total)
+            dialog.setValue(min(received, total))
+            dialog.setLabelText(f"正在下载更新包：{received / 1_048_576:.1f} / {total / 1_048_576:.1f} MB")
+        else:
+            dialog.setRange(0, 0)
+            dialog.setLabelText(f"正在下载更新包：{received / 1_048_576:.1f} MB")
+
+    def _close_update_progress_dialog(self) -> None:
+        dialog = self._update_progress_dialog
+        self._update_progress_dialog = None
+        if dialog is not None:
+            dialog.close()
+            dialog.deleteLater()
+
+    def _on_update_download_completed(self, archive: Path) -> None:
+        self._update_download_thread = None
+        self._close_update_progress_dialog()
+        try:
+            self._launch_updater(Path(archive))
+        except Exception as exc:  # noqa: BLE001
+            self.update_button.setEnabled(True)
+            self.status_label.setText("更新器启动失败。")
+            QMessageBox.critical(self, "更新失败", str(exc))
+
+    def _on_update_download_failed(self, message: str) -> None:
+        self._update_download_thread = None
+        self._close_update_progress_dialog()
+        self.update_button.setEnabled(True)
+        self.status_label.setText("更新下载或校验失败。")
+        QMessageBox.warning(self, "更新失败", message)
+
+    def _launch_updater(self, archive: Path) -> None:
+        if not getattr(sys, "frozen", False):
+            raise RuntimeError("应用内更新仅适用于已安装的软件版本，请先使用发布安装包安装。")
+        executable = Path(sys.executable).resolve()
+        if sys.platform == "win32":
+            source_updater = executable.parent / "YouTubeSubtitleVerifier-Updater.exe"
+            install_root = executable.parent
+            executable_name = executable.name
+            platform_name = "windows"
+        elif sys.platform == "darwin":
+            source_updater = executable.parent / "YouTubeSubtitleVerifier-Updater"
+            app_bundle = next((parent for parent in executable.parents if parent.suffix == ".app"), None)
+            if app_bundle is None:
+                raise RuntimeError("无法确定 macOS 应用安装目录。")
+            install_root = app_bundle
+            executable_name = ""
+            platform_name = "macos"
+        else:
+            raise RuntimeError("当前系统不支持应用内更新。")
+        if not source_updater.is_file():
+            raise RuntimeError("当前安装包缺少更新组件，请先下载安装一次最新完整安装包。")
+        updater_dir = Path(tempfile.mkdtemp(prefix="youtube-subtitle-verifier-updater-"))
+        updater_copy = updater_dir / source_updater.name
+        shutil.copy2(source_updater, updater_copy)
+        if sys.platform != "win32":
+            updater_copy.chmod(updater_copy.stat().st_mode | 0o111)
+        command = [
+            str(updater_copy),
+            "--platform", platform_name,
+            "--pid", str(os.getpid()),
+            "--archive", str(archive),
+            "--install-root", str(install_root),
+        ]
+        if executable_name:
+            command.extend(["--executable-name", executable_name])
+        subprocess.Popen(command, cwd=str(updater_dir))
+        self._persist_workspace_state()
+        self.status_label.setText("更新器已启动，软件将在更新完成后自动重启。")
+        QTimer.singleShot(150, QApplication.instance().quit)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if self._parallel_cover_review_control is not None:

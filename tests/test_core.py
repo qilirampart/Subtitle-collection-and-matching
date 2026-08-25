@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 from time import sleep
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
+from zipfile import ZipFile
 
 from openpyxl import load_workbook
 
@@ -31,10 +32,12 @@ from app.services.subtitle_excel_exporter import export_subtitles_to_xlsx
 from app.services.review_excel_exporter import export_cover_review_results_to_xlsx, export_matching_results_to_xlsx
 from app.services.proxy_discovery_service import ProxyDiscoveryService
 from app.services.task_state import TaskStateStore
+from app.services.update_service import ApplicationUpdateService, UpdateError, is_newer_version, version_key
 from app.services.youtube_audio_service import YouTubeAudioService
 from app.task_control import TaskControl
 from app.ui.workspace_pages import MatchingPage
 from app.workflow import VerificationWorkflow
+from updater.app_updater import update_windows
 
 
 class YouTubeCollectorTests(unittest.TestCase):
@@ -69,6 +72,51 @@ class YouTubeCollectorTests(unittest.TestCase):
 
         self.assertEqual(len(videos), 1)
         self.assertEqual(videos[0].thumbnail_url, "https://img.example/cover.webp")
+
+
+class UpdateServiceTests(unittest.TestCase):
+    def test_orders_calendar_versions_without_string_sorting(self) -> None:
+        self.assertEqual(version_key("v2026.08.25.2"), (2026, 8, 25, 2))
+        self.assertTrue(is_newer_version("2026.08.25.10", "2026.08.25.2"))
+        self.assertFalse(is_newer_version("2026.08.25.2", "2026.08.25.2"))
+
+    def test_selects_architecture_specific_macos_asset(self) -> None:
+        manifest = {
+            "windows": {"url": "https://example/windows.zip", "sha256_url": "https://example/windows.sha", "file_name": "windows.zip"},
+            "macos": {
+                "x64": {"url": "https://example/intel.dmg", "sha256_url": "https://example/intel.sha", "file_name": "intel.dmg"},
+                "arm64": {"url": "https://example/arm.dmg", "sha256_url": "https://example/arm.sha", "file_name": "arm.dmg"},
+            },
+        }
+        asset = ApplicationUpdateService._asset_for_platform(manifest, "macos", "arm64")
+        self.assertEqual(asset.file_name, "arm.dmg")
+
+    def test_rejects_incomplete_update_asset(self) -> None:
+        with self.assertRaises(UpdateError):
+            ApplicationUpdateService._asset_for_platform({"windows": {"url": "https://example/app.zip"}}, "windows", "x64")
+
+    def test_windows_updater_replaces_program_and_preserves_user_data(self) -> None:
+        with TemporaryDirectory() as directory:
+            parent = Path(directory)
+            install_root = parent / "app"
+            (install_root / "runtime").mkdir(parents=True)
+            (install_root / "output").mkdir()
+            (install_root / "runtime" / "api_config.json").write_text("user-config", encoding="utf-8")
+            (install_root / "output" / "result.xlsx").write_text("result", encoding="utf-8")
+            (install_root / "YouTube.exe").write_text("old", encoding="utf-8")
+            archive = parent / "update.zip"
+            with ZipFile(archive, "w") as package:
+                package.writestr("YouTube.exe", "new")
+                package.writestr("runtime/default.txt", "new-runtime")
+                package.writestr("new-file.txt", "new-file")
+            with patch("updater.app_updater.subprocess.Popen") as popen:
+                update_windows(archive, install_root, "YouTube.exe", 0)
+            self.assertEqual((install_root / "YouTube.exe").read_text(encoding="utf-8"), "new")
+            self.assertEqual((install_root / "runtime" / "api_config.json").read_text(encoding="utf-8"), "user-config")
+            self.assertEqual((install_root / "output" / "result.xlsx").read_text(encoding="utf-8"), "result")
+            self.assertEqual((install_root / "new-file.txt").read_text(encoding="utf-8"), "new-file")
+            self.assertFalse(archive.exists())
+            popen.assert_called_once()
 
 
 class MatchingSelectionTests(unittest.TestCase):

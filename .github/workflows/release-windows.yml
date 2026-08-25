@@ -42,9 +42,45 @@ jobs:
           $ErrorActionPreference = 'Stop'
           python -m PyInstaller --noconfirm --clean --windowed --name 'YouTube字幕核验助手' --icon app_icon.ico --distpath release --workpath build --specpath . --add-data 'app_icon.ico;.' --add-data 'app_icon.png;.' --add-data 'asr_probe.mp3;.' --add-data 'tools;tools' --add-data 'runtime\ffmpeg;runtime\ffmpeg' main.py
           ./scripts/trim_windows_release.ps1 -ReleaseDirectory 'release\YouTube字幕核验助手'
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name 'YouTubeSubtitleVerifier-Updater' --distpath updater-dist --workpath updater-build --specpath . updater\app_updater.py
+          Copy-Item 'updater-dist\YouTubeSubtitleVerifier-Updater.exe' 'release\YouTube字幕核验助手\YouTubeSubtitleVerifier-Updater.exe'
           Compress-Archive -Path 'release\YouTube字幕核验助手\*' -DestinationPath '${{ github.workspace }}\YouTubeSubtitleVerifier-Windows-x64.zip' -CompressionLevel Fastest
           (Get-FileHash 'YouTubeSubtitleVerifier-Windows-x64.zip' -Algorithm SHA256).Hash.ToLower() + '  YouTubeSubtitleVerifier-Windows-x64.zip' | Set-Content 'YouTubeSubtitleVerifier-Windows-x64.zip.sha256' -Encoding ascii
           python -m PyInstaller --noconfirm --clean --onefile --windowed --name 'YouTubeSubtitleVerifier-OnlineInstaller' --icon app_icon.ico --distpath installer-dist --workpath installer-build --specpath . installer\online_installer.py
+      - name: Create update manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = '${{ inputs.version || github.ref_name }}'
+          $appVersion = python -c "from app.version import APP_VERSION; print(APP_VERSION)"
+          if ($tag.TrimStart('v') -ne $appVersion) { throw "Tag $tag does not match app.version APP_VERSION=$appVersion" }
+          $base = "https://github.com/qilirampart/Subtitle-collection-and-matching/releases/download/$tag"
+          $windowsArchive = 'YouTubeSubtitleVerifier-Windows-x64.zip'
+          $manifest = [ordered]@{
+            schema_version = 1
+            version = $tag.TrimStart('v')
+            release_tag = $tag
+            release_notes_url = "https://github.com/qilirampart/Subtitle-collection-and-matching/releases/tag/$tag"
+            windows = [ordered]@{
+              url = "$base/$windowsArchive"
+              sha256_url = "$base/$windowsArchive.sha256"
+              file_name = $windowsArchive
+              size_bytes = (Get-Item $windowsArchive).Length
+            }
+            macos = [ordered]@{
+              x64 = [ordered]@{
+                url = "$base/YouTubeSubtitleVerifier-macOS-x64.dmg"
+                sha256_url = "$base/YouTubeSubtitleVerifier-macOS-x64.dmg.sha256"
+                file_name = 'YouTubeSubtitleVerifier-macOS-x64.dmg'
+              }
+              arm64 = [ordered]@{
+                url = "$base/YouTubeSubtitleVerifier-macOS-arm64.dmg"
+                sha256_url = "$base/YouTubeSubtitleVerifier-macOS-arm64.dmg.sha256"
+                file_name = 'YouTubeSubtitleVerifier-macOS-arm64.dmg'
+              }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 6 | Set-Content update.json -Encoding utf8
       - name: Create GitHub release
         shell: pwsh
         env:
@@ -52,4 +88,4 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $tag = '${{ inputs.version || github.ref_name }}'
-          gh release create $tag --title "YouTube 字幕核验助手 $tag" --generate-notes --verify-tag YouTubeSubtitleVerifier-Windows-x64.zip YouTubeSubtitleVerifier-Windows-x64.zip.sha256 installer-dist\YouTubeSubtitleVerifier-OnlineInstaller.exe
+          gh release create $tag --title "YouTube 字幕核验助手 $tag" --generate-notes --verify-tag YouTubeSubtitleVerifier-Windows-x64.zip YouTubeSubtitleVerifier-Windows-x64.zip.sha256 installer-dist\YouTubeSubtitleVerifier-OnlineInstaller.exe update.json

@@ -91,12 +91,12 @@ jobs:
           RELEASE_TAG: ${{ inputs.version || github.ref_name }}
         run: |
           set -euo pipefail
-          for attempt in $(seq 1 20); do
-            if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-              gh release upload "$RELEASE_TAG" "YouTubeSubtitleVerifier-macOS-${{ matrix.asset_suffix }}.dmg" "YouTubeSubtitleVerifier-macOS-${{ matrix.asset_suffix }}.dmg.sha256" "YouTubeSubtitleVerifier-OnlineInstaller-macOS-${{ matrix.asset_suffix }}.dmg" --clobber
+          for attempt in $(seq 1 60); do
+            if gh release upload "$RELEASE_TAG" "YouTubeSubtitleVerifier-macOS-${{ matrix.asset_suffix }}.dmg" "YouTubeSubtitleVerifier-macOS-${{ matrix.asset_suffix }}.dmg.sha256" "YouTubeSubtitleVerifier-OnlineInstaller-macOS-${{ matrix.asset_suffix }}.dmg" --clobber; then
               exit 0
             fi
-            sleep 20
+            echo "Release $RELEASE_TAG is not ready for upload yet (attempt $attempt/60)."
+            sleep 15
           done
-          echo "Windows release $RELEASE_TAG was not created in time." >&2
+          echo "Release $RELEASE_TAG was not ready for macOS asset upload in time." >&2
           exit 1

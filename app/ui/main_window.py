@@ -1343,6 +1343,7 @@ class MainWindow(QMainWindow):
             open_llm=self._open_llm_config,
             open_connection_settings=self._open_connection_settings,
             open_matching_config=self._open_matching_config,
+            check_updates=self._check_for_updates,
             parent=self,
         )
         self._page_stack = QStackedWidget()

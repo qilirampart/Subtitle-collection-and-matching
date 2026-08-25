@@ -1393,6 +1393,7 @@ class SettingsHubPage(QWidget):
         open_llm: Callable[[], None],
         open_connection_settings: Callable[[], None],
         open_matching_config: Callable[[], None],
+        check_updates: Callable[[], None],
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -1410,6 +1411,7 @@ class SettingsHubPage(QWidget):
             ("ASR 配置", "配置多个语音识别服务，并按既有熔断策略自动兜底。", "打开 ASR 配置", open_asr),
             ("语言模型", "配置文本纠偏、封面检测等能力复用的语言模型。", "打开语言模型", open_llm),
             ("匹配服务", "设置匹配服务地址、账号和密码，并在提交匹配前连接。", "设置匹配服务", open_matching_config),
+            ("软件更新", "检查 GitHub 发布的新版本；下载、校验、替换和重启将自动完成。", "检查更新", check_updates),
         )
         for index, (title, hint, action, callback) in enumerate(items):
             card = QFrame()

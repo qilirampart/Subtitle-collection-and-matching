@@ -71,6 +71,21 @@ class YouTubeCollectorTests(unittest.TestCase):
         self.assertEqual(videos[0].thumbnail_url, "https://img.example/cover.webp")
 
 
+class MatchingSelectionTests(unittest.TestCase):
+    def test_filters_matching_items_to_checked_videos_before_coalescing(self) -> None:
+        workflow = VerificationWorkflow()
+        items = [
+            {"source_video_id": "channel-a-1", "source_segment_order": 1},
+            {"source_video_id": "channel-a-1", "source_segment_order": 2},
+            {"source_video_id": "channel-b-1", "source_segment_order": 1},
+        ]
+
+        selected = workflow.filter_video_match_items(items, {"channel-a-1"})
+
+        self.assertEqual(len(selected), 2)
+        self.assertTrue(all(item["source_video_id"] == "channel-a-1" for item in selected))
+
+
 class YouTubeCoverServiceTests(unittest.TestCase):
     def test_downloads_thumbnail_to_simple_video_id_filename(self) -> None:
         response = Mock()

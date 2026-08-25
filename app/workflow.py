@@ -448,6 +448,23 @@ class VerificationWorkflow:
                 normalized.append(result)
         return normalized
 
+    @staticmethod
+    def filter_video_match_items(
+        items: list[dict[str, object]],
+        selected_video_ids: set[str],
+    ) -> list[dict[str, object]]:
+        """Keep only subtitle records belonging to the videos checked in the queue."""
+        selected_ids = {str(video_id or "").strip() for video_id in selected_video_ids}
+        selected_ids.discard("")
+        if not selected_ids:
+            return []
+        return [
+            dict(item)
+            for item in items
+            if isinstance(item, dict)
+            and str(item.get("source_video_id") or "").strip() in selected_ids
+        ]
+
     # Kept as a private compatibility shim for the independent subtitle page.
     def _build_batch_items(self, video: YouTubeVideo, inspection: dict[str, object]) -> list[dict[str, object]]:
         return [self._build_video_match_item(video, inspection)]

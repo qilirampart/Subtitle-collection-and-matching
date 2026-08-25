@@ -2935,8 +2935,21 @@ class MainWindow(QMainWindow):
     def _match(self) -> None:
         if not self._ready_items:
             return
-        self._ready_items = VerificationWorkflow().coalesce_video_match_items(self._ready_items)
-        self._matching_page.set_items(self._ready_items)
+        selected_video_ids = {video.video_id for video in self._selected_videos()}
+        if not selected_video_ids:
+            QMessageBox.warning(self, "没有选择", "请至少勾选一条已准备字幕的视频后再提交匹配。")
+            return
+        workflow = VerificationWorkflow()
+        selected_items = workflow.filter_video_match_items(self._ready_items, selected_video_ids)
+        selected_items = workflow.coalesce_video_match_items(selected_items)
+        if not selected_items:
+            QMessageBox.information(
+                self,
+                "所选视频暂无字幕",
+                "所选视频尚未准备可匹配字幕，请先获取字幕或完成 ASR 转写。",
+            )
+            return
+        self._matching_page.set_items(selected_items)
         credentials = self._matching_service_credentials()
         if credentials is None:
             return
@@ -2944,10 +2957,12 @@ class MainWindow(QMainWindow):
         self._match_paused = False
         self._task_control = None
         self._set_busy(True)
-        self.status_label.setText("正在登录匹配服务并提交字幕任务...")
-        self._active_matching_items = [dict(item) for item in self._ready_items]
+        submit_message = f"正在提交已勾选的 {len(selected_items)} 条视频字幕到匹配服务..."
+        self.status_label.setText(submit_message)
+        self._matching_page.set_status(submit_message)
+        self._active_matching_items = [dict(item) for item in selected_items]
         self._thread = _MatchThread(
-            self._ready_items,
+            selected_items,
             server,
             username,
             password,

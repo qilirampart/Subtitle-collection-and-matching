@@ -597,10 +597,16 @@ class YouTubeAudioService:
                 raise YouTubeServiceError(message or "Compatible YouTube audio download failed.")
             candidates = [
                 path for path in output_dir.glob(f"segment_{index:03d}.*")
-                if path.is_file() and path.suffix.lower() in {".m4a", ".webm"}
+                # yt-dlp can fall back to format 18 when an audio-only stream is
+                # unavailable.  That format is an MP4 containing an audio track,
+                # which is still valid input for the ASR pipeline.
+                if path.is_file() and path.suffix.lower() in {".m4a", ".webm", ".mp4"}
             ]
             if not candidates:
-                raise YouTubeServiceError("Compatible YouTube audio segment was not created.")
+                generated = ",".join(path.name for path in output_dir.glob(f"segment_{index:03d}.*")) or "none"
+                raise YouTubeServiceError(
+                    f"Compatible YouTube audio segment was not created. generated={generated}"
+                )
             result = max(candidates, key=lambda path: path.stat().st_size)
             LOGGER.info(
                 "Compatible YouTube audio segment completed. index=%s range=%s-%s elapsed=%.3fs bytes=%s",

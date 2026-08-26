@@ -40,9 +40,13 @@ def _resolve_ffmpeg_dir(resource_root: Path, app_root: Path) -> Path:
 
 
 def _resolve_probe_audio_path(resource_root: Path, app_root: Path) -> Path:
-    portable_candidate = app_root / "asr_probe.mp3"
-    if portable_candidate.exists():
-        return portable_candidate
+    standard_candidates = (
+        app_root / "asr_probe.mp3",
+        resource_root / "asr_probe.mp3",
+    )
+    for candidate in standard_candidates:
+        if candidate.exists():
+            return candidate
     file_name = "闻渊参考音频.MP3"
     candidates = (
         app_root / file_name,

@@ -42,6 +42,24 @@ class VerificationWorkflow:
         payload["status"] = "asr_required" if caption.asr_required else "ready_for_matching"
         return payload
 
+    @staticmethod
+    def asr_required_inspection(video: YouTubeVideo, leading_seconds: int) -> dict[str, object]:
+        """Build the same pending shape without probing a known caption-less video."""
+        limit = max(1, int(leading_seconds or 180))
+        return {
+            "video": video.to_dict(),
+            "language_code": "",
+            "source_kind": "none",
+            "source_path": "",
+            "text": "",
+            "normalized_text": "",
+            "start_seconds": 0,
+            "end_seconds": limit,
+            "asr_required": True,
+            "status": "asr_required",
+            "asr_status": "skipped_caption_probe",
+        }
+
     def compare_video(
         self,
         video: YouTubeVideo,
@@ -119,6 +137,7 @@ class VerificationWorkflow:
         leading_seconds: int = 180,
         audio_sources: dict[str, str] | None = None,
         allow_asr_fallback: bool = False,
+        skip_caption_probe: bool = False,
         caption_concurrency: int = 1,
         download_concurrency: int = 1,
         asr_concurrency: int = 1,
@@ -138,7 +157,12 @@ class VerificationWorkflow:
             if progress_callback is not None:
                 progress_callback(index, len(videos), video, inspection)
 
-        if caption_workers == 1:
+        if skip_caption_probe:
+            for index, video in enumerate(videos, start=1):
+                if task_control is not None and not task_control.checkpoint():
+                    break
+                handle_inspection(index, video, self.asr_required_inspection(video, leading_seconds))
+        elif caption_workers == 1:
             for index, video in enumerate(videos, start=1):
                 if task_control is not None and not task_control.checkpoint():
                     break
@@ -189,7 +213,17 @@ class VerificationWorkflow:
         ready: list[dict[str, object]] = []
         still_pending: list[dict[str, object]] = []
         if not self.asr_service.is_ready():
-            return ready, list(pending_items)
+            # Preserve the queue, but annotate it so the UI can distinguish
+            # "not configured" from a real download/transcription failure.
+            not_configured = []
+            for item in pending_items:
+                pending = dict(item)
+                inspection = dict(pending.get("inspection") or {})
+                inspection["asr_status"] = "not_configured"
+                inspection["asr_error"] = "ASR 未配置或没有可用的 API 密钥。"
+                pending["inspection"] = inspection
+                not_configured.append(pending)
+            return ready, not_configured
 
         def checkpoint() -> bool:
             return task_control is None or task_control.checkpoint()

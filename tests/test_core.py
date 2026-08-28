@@ -33,7 +33,7 @@ from app.services.youtube_asr import YouTubeAsrService
 from app.services.subtitle_excel_exporter import export_subtitles_to_xlsx
 from app.services.review_excel_exporter import export_cover_review_results_to_xlsx, export_matching_results_to_xlsx
 from app.services.proxy_discovery_service import ProxyDiscoveryService
-from app.services.task_state import TaskStateStore
+from app.services.task_state import TaskStateStore, has_recoverable_work
 from app.services.update_service import ApplicationUpdateService, UpdateError, is_newer_version, version_key
 from app.services.youtube_audio_service import YouTubeAudioService
 from app.task_control import TaskControl
@@ -997,6 +997,37 @@ class ProxyAndRangeRouteTests(unittest.TestCase):
 
         terminate_mock.assert_called_once_with(process)
 
+    def test_compat_process_uses_node_from_the_bundled_path(self) -> None:
+        service = YouTubeAudioService()
+        with TemporaryDirectory() as directory, patch(
+            "app.services.youtube_audio_service.EXTRACTED_AUDIO_DIR", Path(directory)
+        ), patch.object(service, "_run_compat_process", return_value=(0, "", "")) as run_mock, patch.object(
+            service._youtube, "_ffmpeg_proxy_from_environment", return_value=None
+        ), patch.object(service._youtube, "_apply_synced_cookies_to_command", return_value=False):
+            # A zero-second source produces no segment work, so directly inspect
+            # a normal 30-second segment through the public fallback helper.
+            with patch("app.services.youtube_audio_service.subprocess.run") as merge_mock:
+                merge_mock.return_value.returncode = 0
+                output_dir = Path(directory) / "youtube_audio_test"
+                output_dir.mkdir()
+
+                def emit_segment(command, **_kwargs):
+                    template = Path(command[command.index("-o") + 1])
+                    template.with_name(template.name.replace("%(ext)s", "m4a")).write_bytes(b"audio")
+                    return 0, "", ""
+
+                run_mock.side_effect = emit_segment
+                service._download_audio_with_compat_tool(
+                    "https://www.youtube.com/watch?v=test",
+                    duration=30,
+                    concurrency=1,
+                    progress_callback=None,
+                    should_cancel=None,
+                )
+
+        command = run_mock.call_args.args[0]
+        self.assertEqual(command[command.index("--js-runtimes") + 1], "node")
+
     def test_compat_timeout_diagnostics_identifies_missing_first_byte(self) -> None:
         diagnostics = YouTubeAudioService._compat_timeout_diagnostics(  # noqa: SLF001
             started_at=0.0,
@@ -1061,6 +1092,29 @@ class TaskStateStoreTests(unittest.TestCase):
         self.assertTrue(loaded["active"])
         self.assertEqual(loaded["items"][0]["video_id"], "video-1")
         self.assertTrue(loaded["updated_at"])
+
+    def test_failed_task_with_pending_items_is_recoverable(self) -> None:
+        payload = {
+            "active": False,
+            "status": "任务失败",
+            "task_spec": {"kind": "asr_fallback"},
+            "videos": [{"video_id": "video-1"}],
+            "pending_asr": [{"video": {"video_id": "video-1"}}],
+        }
+
+        self.assertTrue(has_recoverable_work(payload))
+
+    def test_completed_task_without_remaining_items_is_not_recoverable(self) -> None:
+        payload = {
+            "active": False,
+            "status": "字幕准备完成",
+            "task_spec": {"kind": "prepare"},
+            "videos": [{"video_id": "video-1"}],
+            "ready_items": [{"source_video_id": "video-1"}],
+            "pending_asr": [],
+        }
+
+        self.assertFalse(has_recoverable_work(payload))
 
 
 if __name__ == "__main__":

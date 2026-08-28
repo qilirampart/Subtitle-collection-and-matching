@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from copy import deepcopy
+from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from app.config.settings import API_CONFIG_PATH, DOWNLOADER_CONFIG_PATH, TENCENT_ASR_CONFIG_PATH
@@ -123,6 +127,11 @@ DEFAULT_API_CONFIG: dict[str, Any] = {
 }
 
 
+# Several worker threads create short-lived ApiConfigService instances. Keep
+# config reads/writes safe, and never expose a partially truncated JSON file.
+_CONFIG_IO_LOCK = RLock()
+
+
 class ApiConfigService:
     ASR_PROVIDER_LABELS = {
         "tencent_asr": "腾讯云 ASR",
@@ -137,18 +146,23 @@ class ApiConfigService:
         if self._config is not None and not force_reload:
             return deepcopy(self._config)
 
-        if API_CONFIG_PATH.exists():
-            raw = self._read_json(API_CONFIG_PATH) or {}
-            source = str(API_CONFIG_PATH)
-        else:
-            raw = self._build_from_legacy_configs()
-            source = "legacy runtime configs"
+        with _CONFIG_IO_LOCK:
+            config_exists = API_CONFIG_PATH.exists()
+            if config_exists:
+                raw = self._read_json(API_CONFIG_PATH) or {}
+                source = str(API_CONFIG_PATH)
+            else:
+                raw = self._build_from_legacy_configs()
+                source = "legacy runtime configs"
 
-        normalized = self.normalize_config(raw)
-        self._persist(normalized)
-        self._config = normalized
-        self._logger.info("Loaded API configuration from %s", source)
-        return deepcopy(normalized)
+            normalized = self.normalize_config(raw)
+            # Reading a valid config must not rewrite it. In particular, this
+            # avoids a burst of worker threads repeatedly truncating the file.
+            if not config_exists or raw != normalized:
+                self._persist(normalized)
+            self._config = normalized
+            self._logger.info("Loaded API configuration from %s", source)
+            return deepcopy(normalized)
 
     def save_config(self, config: dict[str, Any]) -> dict[str, Any]:
         normalized = self.normalize_config(config)
@@ -721,7 +735,32 @@ class ApiConfigService:
 
     def _persist(self, config: dict[str, Any]) -> None:
         API_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        API_CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        payload = json.dumps(config, ensure_ascii=False, indent=2)
+        with _CONFIG_IO_LOCK:
+            # Write beside the target and replace it in one filesystem
+            # operation. Readers see either the old complete JSON or the new
+            # complete JSON, never an empty/truncated file.
+            temporary_path: str | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=API_CONFIG_PATH.parent,
+                    prefix=f".{API_CONFIG_PATH.stem}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as temporary_file:
+                    temporary_file.write(payload)
+                    temporary_file.flush()
+                    os.fsync(temporary_file.fileno())
+                    temporary_path = temporary_file.name
+                os.replace(temporary_path, API_CONFIG_PATH)
+            finally:
+                if temporary_path:
+                    try:
+                        Path(temporary_path).unlink(missing_ok=True)
+                    except OSError:
+                        pass
         self._logger.info("Saved API configuration to %s", API_CONFIG_PATH)
 
     @staticmethod

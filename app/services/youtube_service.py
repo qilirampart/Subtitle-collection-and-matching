@@ -466,8 +466,11 @@ class YouTubeService:
                 environment[name] = proxy
         process = subprocess.Popen(
             command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            # This route does not consume process output. Do not expose pipes
+            # to ffmpeg/Node descendants, or cleanup can wait on inherited
+            # handles after yt-dlp has already exited.
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             text=True,
             encoding="utf-8",
             errors="replace",
@@ -481,7 +484,7 @@ class YouTubeService:
             time.sleep(0.2)
         _stdout, stderr = process.communicate()
         if process.returncode != 0:
-            raise YouTubeServiceError(stderr.strip() or "yt-dlp nightly 下载失败。")
+            raise YouTubeServiceError("yt-dlp nightly 下载失败。")
         candidates = [
             path
             for path in output_path.parent.glob(f"{output_path.stem}.*")
@@ -506,7 +509,17 @@ class YouTubeService:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
+                # Terminating timed-out compatibility workers must not flash a
+                # console window for each segment.
+                **_hidden_process_kwargs(),
             )
+            # taskkill returns before Python's process handle is necessarily
+            # reaped. Wait here so callers never start a replacement process
+            # while the old yt-dlp/Node/ffmpeg tree is still shutting down.
+            try:
+                process.wait(timeout=5)
+            except (subprocess.TimeoutExpired, OSError):
+                LOGGER.warning("Compatibility process did not exit after taskkill. pid=%s", process.pid)
             return
         process.terminate()
         try:

@@ -6,11 +6,12 @@ import math
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Event, Thread
+from threading import BoundedSemaphore, Event, Thread
 from typing import Callable
 
 import requests
@@ -31,6 +32,10 @@ from app.utils.paths import next_compact_name
 
 LOGGER = get_logger(__name__)
 
+# Each compatibility segment may start Node.js for YouTube challenge solving.
+# Keep the user-selectable ceiling at three to balance throughput and stability.
+_COMPAT_PROCESS_SLOTS = BoundedSemaphore(value=3)
+
 
 @dataclass(frozen=True)
 class YouTubeAudioDownloadResult:
@@ -46,8 +51,12 @@ class YouTubeAudioService:
     _COMPAT_SEGMENT_SECONDS = 30
     _COMPAT_MAX_WORKERS = 6
     _COMPAT_SEGMENT_TIMEOUT_SECONDS = 90
-    _COMPAT_FIRST_OUTPUT_TIMEOUT_SECONDS = 40
+    # web_embedded may spend tens of seconds completing its JavaScript and
+    # signed-media handshake before ffmpeg creates the temporary file. Let the
+    # segment deadline, rather than an early first-byte cutoff, decide failure.
+    _COMPAT_FIRST_OUTPUT_TIMEOUT_SECONDS = _COMPAT_SEGMENT_TIMEOUT_SECONDS
     _COMPAT_MERGE_TIMEOUT_SECONDS = 60
+    _COMPAT_SEGMENT_RETRIES = 1
     _DIRECT_RANGE_MAX_SECONDS = 300
     _DIRECT_RANGE_BUFFER_SECONDS = 12
     _DIRECT_METADATA_TIMEOUT_SECONDS = 45
@@ -378,7 +387,11 @@ class YouTubeAudioService:
         command = [
             str(YOUTUBE_COMPAT_YTDLP_PATH),
             "--js-runtimes",
+            # The bundled Node directory is prepended to PATH below. Keep the
+            # runtime name simple so yt-dlp uses its normal Windows launcher.
             "node",
+            "--extractor-args",
+            "youtube:player_client=web_embedded",
             "--no-warnings",
             "--no-progress",
             "-J",
@@ -417,12 +430,20 @@ class YouTubeAudioService:
         deadline = time.monotonic() + self._DIRECT_METADATA_TIMEOUT_SECONDS
         while not completed.wait(0.2):
             if should_cancel is not None and should_cancel():
-                self._youtube._terminate_process_tree(process)  # noqa: SLF001
-                completed.wait(5)
+                self._stop_compat_process(
+                    process,
+                    completed=completed,
+                    description="Direct YouTube audio metadata",
+                    reason="cancelled",
+                )
                 raise YouTubeDownloadCancelled("Audio download cancelled.")
             if time.monotonic() >= deadline:
-                self._youtube._terminate_process_tree(process)  # noqa: SLF001
-                completed.wait(5)
+                self._stop_compat_process(
+                    process,
+                    completed=completed,
+                    description="Direct YouTube audio metadata",
+                    reason="metadata timeout",
+                )
                 raise YouTubeServiceError("Direct YouTube audio metadata request timed out.")
         collector_thread.join(timeout=0.1)
         stdout, _stderr = output.get("value", ("", ""))
@@ -521,7 +542,9 @@ class YouTubeAudioService:
         should_cancel: Callable[[], bool] | None,
     ) -> YouTubeAudioDownloadResult:
         """Use yt-dlp nightly's JS challenge solver with parallel audio ranges."""
-        workers = max(1, min(int(concurrency or 1), self._COMPAT_MAX_WORKERS))
+        # Each compatibility worker starts yt-dlp and may initialize a Node
+        # challenge runtime. Three is the deliberate stability ceiling.
+        workers = max(1, min(int(concurrency or 1), 3))
         download_started = time.monotonic()
         output_dir = EXTRACTED_AUDIO_DIR / next_compact_name("youtube_audio")
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -550,6 +573,8 @@ class YouTubeAudioService:
                 str(YOUTUBE_COMPAT_YTDLP_PATH),
                 "--js-runtimes",
                 "node",
+                "--extractor-args",
+                "youtube:player_client=web_embedded",
                 "--no-warnings",
                 "--no-progress",
                 "-f",
@@ -576,25 +601,59 @@ class YouTubeAudioService:
             if proxy:
                 for key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
                     environment[key] = proxy
-            segment_started = time.monotonic()
-            returncode, stdout, stderr = self._run_compat_process(
-                command,
-                env=environment,
-                should_cancel=should_stop,
-                timeout_seconds=self._COMPAT_SEGMENT_TIMEOUT_SECONDS,
-                description=f"Compatible YouTube audio segment {index + 1}/{len(segments)}",
-                activity_probe=lambda: self._compat_segment_bytes(output_dir, index),
-            )
-            if returncode != 0:
-                message = stderr.strip() or stdout.strip()
-                LOGGER.warning(
-                    "Compatible YouTube audio process failed. task=segment %s/%s exit_code=%s diagnostics=%s",
-                    index + 1,
-                    len(segments),
-                    returncode,
-                    self._compact_process_diagnostics(message),
-                )
-                raise YouTubeServiceError(message or "Compatible YouTube audio download failed.")
+            last_error: Exception | None = None
+            for attempt in range(self._COMPAT_SEGMENT_RETRIES + 1):
+                if attempt:
+                    for stale_path in output_dir.glob(f"segment_{index:03d}.*"):
+                        stale_path.unlink(missing_ok=True)
+                    LOGGER.warning(
+                        "Retrying compatible YouTube audio segment. segment=%s/%s attempt=%s/%s",
+                        index + 1,
+                        len(segments),
+                        attempt + 1,
+                        self._COMPAT_SEGMENT_RETRIES + 1,
+                    )
+                    time.sleep(1)
+                try:
+                    segment_started = time.monotonic()
+                    returncode, stdout, stderr = self._run_compat_process(
+                        command,
+                        env=environment,
+                        should_cancel=should_stop,
+                        timeout_seconds=self._COMPAT_SEGMENT_TIMEOUT_SECONDS,
+                        description=f"Compatible YouTube audio segment {index + 1}/{len(segments)}",
+                        activity_probe=lambda: self._compat_segment_bytes(output_dir, index),
+                    )
+                    if returncode != 0:
+                        message = stderr.strip() or stdout.strip()
+                        last_error = YouTubeServiceError(
+                            message or "Compatible YouTube audio download failed."
+                        )
+                        LOGGER.warning(
+                            "Compatible YouTube audio process failed. task=segment %s/%s exit_code=%s diagnostics=%s",
+                            index + 1,
+                            len(segments),
+                            returncode,
+                            self._compact_process_diagnostics(message),
+                        )
+                    else:
+                        last_error = None
+                        break
+                except YouTubeDownloadCancelled:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - retry transient segment stalls
+                    last_error = exc
+                    LOGGER.warning(
+                        "Compatible YouTube audio segment attempt failed. segment=%s/%s attempt=%s error=%s",
+                        index + 1,
+                        len(segments),
+                        attempt + 1,
+                        self._compact_process_diagnostics(str(exc)),
+                    )
+                if attempt < self._COMPAT_SEGMENT_RETRIES:
+                    continue
+            if last_error is not None:
+                raise last_error
             candidates = [
                 path for path in output_dir.glob(f"segment_{index:03d}.*")
                 # yt-dlp can fall back to format 18 when an audio-only stream is
@@ -689,107 +748,207 @@ class YouTubeAudioService:
         activity_probe: Callable[[], int] | None = None,
     ) -> tuple[int, str, str]:
         """Run yt-dlp while polling cancellation and enforcing a segment deadline."""
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env,
-            **_hidden_process_kwargs(),
-        )
-        if should_cancel():
-            self._youtube._terminate_process_tree(process)  # noqa: SLF001
-            process.communicate()
-            raise YouTubeDownloadCancelled("Audio download cancelled.")
-        output: dict[str, tuple[str, str]] = {}
-        completed = Event()
-
-        def collect_output() -> None:
-            output["value"] = process.communicate()
-            completed.set()
-
-        # Even with yt-dlp progress hidden, delegated ffmpeg diagnostics can
-        # exceed the OS pipe buffer. Drain continuously so a child cannot be
-        # mistaken for a network timeout merely because its stderr is blocked.
-        collector_thread = Thread(target=collect_output, name="youtube-compat-output", daemon=True)
-        collector_thread.start()
-        started_at = time.monotonic()
-        deadline = time.monotonic() + max(1, int(timeout_seconds or 1))
-        observed_bytes = 0
-        first_output_at: float | None = None
-        last_growth_at: float | None = None
-        while not completed.wait(0.2):
-            if activity_probe is not None:
-                try:
-                    current_bytes = max(0, int(activity_probe() or 0))
-                except OSError:
-                    current_bytes = observed_bytes
-                if current_bytes > observed_bytes:
-                    now = time.monotonic()
-                    observed_bytes = current_bytes
-                    if first_output_at is None:
-                        first_output_at = now
-                        LOGGER.info(
-                            "Compatible YouTube audio temporary output started. task=%s first_byte_elapsed=%.3fs bytes=%s",
-                            description,
-                            max(now - started_at, 0.001),
-                            observed_bytes,
-                        )
-                    last_growth_at = now
-            if completed.is_set():
-                break
+        while not _COMPAT_PROCESS_SLOTS.acquire(timeout=0.2):
             if should_cancel():
-                self._youtube._terminate_process_tree(process)  # noqa: SLF001
-                completed.wait(5)
-                LOGGER.info("Compatible YouTube audio process cancelled. task=%s", description)
                 raise YouTubeDownloadCancelled("Audio download cancelled.")
-            now = time.monotonic()
-            if first_output_at is None and now - started_at >= self._COMPAT_FIRST_OUTPUT_TIMEOUT_SECONDS:
-                self._youtube._terminate_process_tree(process)  # noqa: SLF001
-                completed.wait(5)
-                stdout, stderr = output.get("value", ("", ""))
-                diagnostics = self._compat_timeout_diagnostics(
-                    started_at=started_at,
-                    observed_bytes=observed_bytes,
-                    first_output_at=first_output_at,
-                    last_growth_at=last_growth_at,
+        slot_released = False
+
+        def release_slot() -> None:
+            nonlocal slot_released
+            if not slot_released:
+                slot_released = True
+                _COMPAT_PROCESS_SLOTS.release()
+
+        # Use files rather than PIPE. A delegated ffmpeg process can inherit a
+        # pipe handle and keep communicate() blocked after yt-dlp exits. Files
+        # preserve diagnostics without creating that Windows handle lifetime.
+        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    text=False,
+                    env=env,
+                    **_hidden_process_kwargs(),
                 )
+            except Exception:
+                release_slot()
+                raise
+            LOGGER.info("Compatible YouTube audio process started. task=%s pid=%s", description, process.pid)
+            if should_cancel():
+                self._stop_compat_process(
+                    process,
+                    completed=None,
+                    description=description,
+                    reason="cancelled before output collection",
+                )
+                release_slot()
+                raise YouTubeDownloadCancelled("Audio download cancelled.")
+            completed = Event()
+
+            def collect_output() -> None:
+                process.wait()
+                completed.set()
+
+            collector_thread = Thread(target=collect_output, name="youtube-compat-output", daemon=True)
+            collector_thread.start()
+            started_at = time.monotonic()
+            deadline = time.monotonic() + max(1, int(timeout_seconds or 1))
+            observed_bytes = 0
+            first_output_at: float | None = None
+            last_growth_at: float | None = None
+            while not completed.wait(0.2):
+                if activity_probe is not None:
+                    try:
+                        current_bytes = max(0, int(activity_probe() or 0))
+                    except OSError:
+                        current_bytes = observed_bytes
+                    if current_bytes > observed_bytes:
+                        now = time.monotonic()
+                        observed_bytes = current_bytes
+                        if first_output_at is None:
+                            first_output_at = now
+                            LOGGER.info(
+                                "Compatible YouTube audio temporary output started. task=%s first_byte_elapsed=%.3fs bytes=%s",
+                                description,
+                                max(now - started_at, 0.001),
+                                observed_bytes,
+                            )
+                        last_growth_at = now
+                if completed.is_set():
+                    break
+                if should_cancel():
+                    self._stop_compat_process(
+                        process,
+                        completed=completed,
+                        description=description,
+                        reason="cancelled",
+                    )
+                    LOGGER.info("Compatible YouTube audio process cancelled. task=%s", description)
+                    release_slot()
+                    raise YouTubeDownloadCancelled("Audio download cancelled.")
+                now = time.monotonic()
+                if first_output_at is None and now - started_at >= self._COMPAT_FIRST_OUTPUT_TIMEOUT_SECONDS:
+                    self._stop_compat_process(
+                        process,
+                        completed=completed,
+                        description=description,
+                        reason="first-output timeout",
+                    )
+                    stdout, stderr = self._read_compat_process_output(stdout_file, stderr_file)
+                    diagnostics = self._compat_timeout_diagnostics(
+                        started_at=started_at,
+                        observed_bytes=observed_bytes,
+                        first_output_at=first_output_at,
+                        last_growth_at=last_growth_at,
+                    )
+                    LOGGER.warning(
+                        "Compatible YouTube audio process produced no temporary output. task=%s first_output_timeout_seconds=%s diagnostics=%s output_tail=%s",
+                        description,
+                        self._COMPAT_FIRST_OUTPUT_TIMEOUT_SECONDS,
+                        diagnostics,
+                        self._compact_process_diagnostics(stderr or stdout),
+                    )
+                    release_slot()
+                    raise YouTubeServiceError(
+                        f"{description} did not produce temporary output within "
+                        f"{self._COMPAT_FIRST_OUTPUT_TIMEOUT_SECONDS} seconds ({diagnostics})."
+                    )
+                if now >= deadline:
+                    self._stop_compat_process(
+                        process,
+                        completed=completed,
+                        description=description,
+                        reason="segment timeout",
+                    )
+                    stdout, stderr = self._read_compat_process_output(stdout_file, stderr_file)
+                    diagnostics = self._compat_timeout_diagnostics(
+                        started_at=started_at,
+                        observed_bytes=observed_bytes,
+                        first_output_at=first_output_at,
+                        last_growth_at=last_growth_at,
+                    )
+                    LOGGER.warning(
+                        "Compatible YouTube audio process timed out. task=%s timeout_seconds=%s diagnostics=%s output_tail=%s",
+                        description,
+                        timeout_seconds,
+                        diagnostics,
+                        self._compact_process_diagnostics(stderr or stdout),
+                    )
+                    release_slot()
+                    raise YouTubeServiceError(
+                        f"{description} timed out after {timeout_seconds} seconds ({diagnostics})."
+                    )
+            collector_thread.join(timeout=0.1)
+            stdout, stderr = self._read_compat_process_output(stdout_file, stderr_file)
+            release_slot()
+            return process.returncode or 0, stdout, stderr
+
+    @staticmethod
+    def _read_compat_process_output(stdout_file: object, stderr_file: object) -> tuple[str, str]:
+        values: list[str] = []
+        for stream in (stdout_file, stderr_file):
+            try:
+                stream.seek(0)  # type: ignore[attr-defined]
+                raw = stream.read()  # type: ignore[attr-defined]
+            except (OSError, ValueError):
+                raw = b""
+            if isinstance(raw, bytes):
+                values.append(raw.decode("utf-8", errors="replace"))
+            else:
+                values.append(str(raw or ""))
+        return values[0], values[1]
+
+    def _stop_compat_process(
+        self,
+        process: subprocess.Popen,
+        *,
+        completed: Event | None,
+        description: str,
+        reason: str,
+    ) -> None:
+        """Terminate a compatibility process and wait for its output collector.
+
+        A segment can start yt-dlp, Node, and ffmpeg.  Releasing its concurrency
+        slot before all of them have stopped causes a rapid process-start storm
+        after a YouTube failure, which is particularly unstable on Windows.
+        """
+        try:
+            still_running = process.poll() is None
+        except Exception:  # noqa: BLE001 - keep cleanup best-effort
+            still_running = True
+        if still_running:
+            LOGGER.info(
+                "Stopping compatible YouTube audio process. task=%s pid=%s reason=%s",
+                description,
+                getattr(process, "pid", "unknown"),
+                reason,
+            )
+            self._youtube._terminate_process_tree(process)  # noqa: SLF001
+
+        if completed is not None:
+            if not completed.wait(8):
                 LOGGER.warning(
-                    "Compatible YouTube audio process produced no temporary output. task=%s first_output_timeout_seconds=%s diagnostics=%s output_tail=%s",
+                    "Compatible YouTube audio process did not finish after termination. task=%s pid=%s",
                     description,
-                    self._COMPAT_FIRST_OUTPUT_TIMEOUT_SECONDS,
-                    diagnostics,
-                    self._compact_process_diagnostics(stderr or stdout),
+                    getattr(process, "pid", "unknown"),
                 )
-                raise YouTubeServiceError(
-                    f"{description} did not produce temporary output within "
-                    f"{self._COMPAT_FIRST_OUTPUT_TIMEOUT_SECONDS} seconds ({diagnostics})."
-                )
-            if now >= deadline:
-                self._youtube._terminate_process_tree(process)  # noqa: SLF001
-                completed.wait(5)
-                stdout, stderr = output.get("value", ("", ""))
-                diagnostics = self._compat_timeout_diagnostics(
-                    started_at=started_at,
-                    observed_bytes=observed_bytes,
-                    first_output_at=first_output_at,
-                    last_growth_at=last_growth_at,
-                )
+        else:
+            try:
+                process.communicate(timeout=8)
+            except (subprocess.TimeoutExpired, OSError):
                 LOGGER.warning(
-                    "Compatible YouTube audio process timed out. task=%s timeout_seconds=%s diagnostics=%s output_tail=%s",
+                    "Compatible YouTube audio process did not exit promptly. task=%s pid=%s",
                     description,
-                    timeout_seconds,
-                    diagnostics,
-                    self._compact_process_diagnostics(stderr or stdout),
+                    getattr(process, "pid", "unknown"),
                 )
-                raise YouTubeServiceError(
-                    f"{description} timed out after {timeout_seconds} seconds ({diagnostics})."
-                )
-        collector_thread.join(timeout=0.1)
-        stdout, stderr = output.get("value", ("", ""))
-        return process.returncode or 0, stdout or "", stderr or ""
+        LOGGER.info(
+            "Compatible YouTube audio process stop completed. task=%s pid=%s return_code=%s",
+            description,
+            getattr(process, "pid", "unknown"),
+            getattr(process, "returncode", "unknown"),
+        )
 
     @staticmethod
     def _compat_segment_bytes(output_dir: Path, index: int) -> int:

@@ -407,7 +407,7 @@ class SubtitlePage(QWidget):
     def __init__(
         self,
         *,
-        start_transcription: Callable[[list[str], int, bool], None],
+        start_transcription: Callable[[list[str], int, bool, bool], None],
         import_downloads: Callable[[], list[str]],
         pause_transcription: Callable[[], None],
         cancel_transcription: Callable[[], None],
@@ -452,9 +452,14 @@ class SubtitlePage(QWidget):
         self.duration_combo.setCurrentIndex(1)
         self.asr_fallback_check = QCheckBox("无直出字幕时执行 ASR 兜底")
         self.asr_fallback_check.setChecked(True)
+        self.skip_caption_probe_check = QCheckBox("已知无字幕时跳过探测，直接下载转写")
+        self.skip_caption_probe_check.setToolTip(
+            "适用于已确认没有字幕接口的视频；开启后不请求字幕接口，直接下载音频并进行 ASR。"
+        )
         input_layout.addWidget(QLabel("识别范围"), 1, 3)
         input_layout.addWidget(self.duration_combo, 1, 4)
         input_layout.addWidget(self.asr_fallback_check, 2, 1, 1, 4)
+        input_layout.addWidget(self.skip_caption_probe_check, 3, 1, 1, 4)
         input_layout.setColumnStretch(1, 1)
         root.addWidget(input_card)
 
@@ -560,7 +565,8 @@ class SubtitlePage(QWidget):
         self._start_transcription(
             list(self._sources),
             int(self.duration_combo.currentData() or 180),
-            self.asr_fallback_check.isChecked(),
+            self.asr_fallback_check.isChecked() or self.skip_caption_probe_check.isChecked(),
+            self.skip_caption_probe_check.isChecked(),
         )
 
     def _refresh_table(self) -> None:
@@ -588,7 +594,14 @@ class SubtitlePage(QWidget):
         self.preview_edit.setPlainText(self._preview_texts.get(rows[0].row(), "") if rows else "")
 
     def set_busy(self, busy: bool) -> None:
-        for widget in (self.source_input, self.start_button, self.duration_combo, self.asr_fallback_check, self.downloaded_button):
+        for widget in (
+            self.source_input,
+            self.start_button,
+            self.duration_combo,
+            self.asr_fallback_check,
+            self.skip_caption_probe_check,
+            self.downloaded_button,
+        ):
             widget.setEnabled(not busy)
         if not busy:
             self.downloaded_button.setEnabled("(0)" not in self.downloaded_button.text())
@@ -1129,9 +1142,10 @@ class MatchingPage(QWidget):
         self.load_context_button.setText("重试加载上下文")
         self.load_context_button.setEnabled(bool(self._selected_evidence_uid))
 
-    def set_busy(self, busy: bool) -> None:
-        for widget in (self.top_k_spin, self.submit_button, self.export_button):
-            widget.setEnabled(not busy)
+    def set_busy(self, busy: bool, *, submission_blocked: bool = False) -> None:
+        self.top_k_spin.setEnabled(not busy and not submission_blocked)
+        self.submit_button.setEnabled(not busy and not submission_blocked)
+        self.export_button.setEnabled(not busy)
         self.pause_button.setEnabled(busy)
         self.cancel_button.setEnabled(busy)
 

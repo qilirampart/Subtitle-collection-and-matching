@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from pathlib import Path
 
-from PySide6.QtCore import QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QLockFile, QThread, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
@@ -68,8 +68,8 @@ from app.services.update_service import ApplicationUpdateService, AvailableUpdat
 from app.services.youtube_audio_service import YouTubeAudioService
 from app.services.youtube_service import YouTubeDownloadCancelled, YouTubeService
 from app.services.youtube_asr import YouTubeAsrService
-from app.services.task_state import TaskStateStore
-from app.settings import COVER_DIR, PROJECT_ROOT
+from app.services.task_state import TaskStateStore, has_recoverable_work
+from app.settings import COVER_DIR, PROJECT_ROOT, RUNTIME_DIR
 from app.workflow import VerificationWorkflow
 from app.ui.asr_config_dialog import AsrConfigDialog
 from app.ui.llm_config_dialog import LlmConfigDialog
@@ -285,6 +285,7 @@ class _PrepareThread(QThread):
         control: TaskControl,
         *,
         allow_asr_fallback: bool = False,
+        skip_caption_probe: bool = False,
         caption_concurrency: int = 1,
         download_concurrency: int = 1,
         asr_concurrency: int = 1,
@@ -294,6 +295,7 @@ class _PrepareThread(QThread):
         self.seconds = seconds
         self.control = control
         self.allow_asr_fallback = allow_asr_fallback
+        self.skip_caption_probe = skip_caption_probe
         self.caption_concurrency = caption_concurrency
         self.download_concurrency = download_concurrency
         self.asr_concurrency = asr_concurrency
@@ -304,6 +306,7 @@ class _PrepareThread(QThread):
                 self.videos,
                 leading_seconds=self.seconds,
                 allow_asr_fallback=self.allow_asr_fallback,
+                skip_caption_probe=self.skip_caption_probe,
                 caption_concurrency=self.caption_concurrency,
                 download_concurrency=self.download_concurrency,
                 asr_concurrency=self.asr_concurrency,
@@ -700,11 +703,19 @@ class _StandaloneSubtitleThread(QThread):
     completed = Signal(object, object, bool)
     failed = Signal(str)
 
-    def __init__(self, sources: list[str], seconds: int, allow_asr_fallback: bool, control: TaskControl) -> None:
+    def __init__(
+        self,
+        sources: list[str],
+        seconds: int,
+        allow_asr_fallback: bool,
+        control: TaskControl,
+        skip_caption_probe: bool = False,
+    ) -> None:
         super().__init__()
         self.sources = sources
         self.seconds = seconds
         self.allow_asr_fallback = allow_asr_fallback
+        self.skip_caption_probe = skip_caption_probe
         self.control = control
 
     def run(self) -> None:
@@ -720,7 +731,11 @@ class _StandaloneSubtitleThread(QThread):
                 try:
                     if YouTubeService.is_youtube_url(source):
                         video = self._video_from_url(source)
-                        inspection = workflow.inspect_video(video, leading_seconds=self.seconds)
+                        inspection = (
+                            workflow.asr_required_inspection(video, self.seconds)
+                            if self.skip_caption_probe
+                            else workflow.inspect_video(video, leading_seconds=self.seconds)
+                        )
                         if inspection.get("status") == "asr_required" and self.allow_asr_fallback:
                             inspection = workflow._try_asr_fallback(  # noqa: SLF001
                                 video,
@@ -867,6 +882,8 @@ class MainWindow(QMainWindow):
         self._match_paused = False
         self._task_control: TaskControl | None = None
         self._thread: QThread | None = None
+        # The matching service owns its queue; keep it independent from local workers.
+        self._matching_thread: _MatchThread | None = None
         self._parallel_cover_review_thread: _CoverReviewThread | None = None
         self._parallel_cover_review_control: TaskControl | None = None
         self._evidence_thread: _EvidenceContextThread | None = None
@@ -880,6 +897,10 @@ class MainWindow(QMainWindow):
         self._update_progress_dialog: QProgressDialog | None = None
         self._api_config_service = ApiConfigService()
         self._standalone_download_results: list[dict[str, object]] = []
+        self._task_spec: dict[str, object] = {}
+        self._resume_auto_asr = False
+        self._recovery_prompt_shown = False
+        self._closing_for_recovery = False
         self._state_store = TaskStateStore()
         self._state_persist_timer = QTimer(self)
         self._state_persist_timer.setSingleShot(True)
@@ -889,7 +910,6 @@ class MainWindow(QMainWindow):
         self._apply_matching_service_config(self._api_config_service.get_matching_service_config())
         self._workspace_refresh_timer.timeout.connect(self._refresh_workspace_pages)
         self._workspace_refresh_timer.start(800)
-        QTimer.singleShot(100, self._offer_workspace_recovery)
         QTimer.singleShot(500, self._offer_detected_system_proxy)
 
     def _build_ui(self) -> None:
@@ -1075,6 +1095,10 @@ class MainWindow(QMainWindow):
         self.asr_fallback_button.setEnabled(False)
         self.auto_asr_fallback_check = QCheckBox("无直出字幕时自动下载音频并 ASR 兜底（稳定方案）")
         self.auto_asr_fallback_check.setToolTip("启用后，每条视频未获取直出字幕时会立即使用稳定下载方案转写；关闭后保留到待兜底列表手动处理。")
+        self.skip_caption_probe_check = QCheckBox("已知无字幕时直接下载转写")
+        self.skip_caption_probe_check.setToolTip(
+            "适用于已确认没有字幕接口的视频；开启后跳过字幕探测，直接下载音频并进行 ASR。"
+        )
         self.auto_cover_review_check = QCheckBox("获取字幕时同步检测已下载封面（3路）")
         self.auto_cover_review_check.setToolTip("仅检测已成功下载的封面；与字幕获取并行运行，模型检测最多 3 路。")
         self.asr_download_concurrency_combo = QComboBox()
@@ -1084,7 +1108,11 @@ class MainWindow(QMainWindow):
         # options row from pushing controls outside the narrow workbench.
         self.auto_asr_fallback_check.setText("自动 ASR 兜底")
         self.auto_cover_review_check.setText("同步封面检测")
-        for checkbox in (self.auto_asr_fallback_check, self.auto_cover_review_check):
+        for checkbox in (
+            self.auto_asr_fallback_check,
+            self.skip_caption_probe_check,
+            self.auto_cover_review_check,
+        ):
             checkbox.setMinimumWidth(0)
             checkbox.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         for combo in (
@@ -1136,6 +1164,7 @@ class MainWindow(QMainWindow):
         workflow_layout.addLayout(self._workflow_steps_layout)
         workflow_options = QHBoxLayout()
         workflow_options.addWidget(self.auto_asr_fallback_check)
+        workflow_options.addWidget(self.skip_caption_probe_check)
         workflow_options.addWidget(QLabel("字幕"))
         workflow_options.addWidget(self.caption_concurrency_combo)
         workflow_options.addWidget(QLabel("下载"))
@@ -1162,19 +1191,43 @@ class MainWindow(QMainWindow):
         self.select_all_button.clicked.connect(self._select_all)
         self.invert_selection_button = QPushButton("反选")
         self.invert_selection_button.clicked.connect(self._invert_selection)
+        self.select_count_spin = QSpinBox()
+        self.select_count_spin.setRange(1, 2000)
+        self.select_count_spin.setValue(10)
+        self.select_count_spin.setSuffix(" 条")
+        self.select_count_spin.setFixedWidth(78)
+        self.select_count_spin.setFixedHeight(32)
+        self.select_count_spin.setToolTip("输入要勾选的前 N 条视频")
         self.select_first_ten_button = QPushButton("勾选前 10 条")
         self.select_first_ten_button.clicked.connect(self._select_first_ten)
+        self.select_count_spin.valueChanged.connect(
+            lambda value: self.select_first_ten_button.setText(f"勾选前 {value} 条")
+        )
+        self._select_count_widget = QWidget()
+        select_count_layout = QHBoxLayout(self._select_count_widget)
+        select_count_layout.setContentsMargins(0, 0, 0, 0)
+        select_count_layout.setSpacing(6)
+        select_count_layout.addWidget(self.select_count_spin)
+        select_count_layout.addWidget(self.select_first_ten_button)
         self.channel_selection_combo = QComboBox()
         self.channel_selection_combo.setMinimumWidth(0)
         self.channel_selection_combo.addItem("选择频道", "")
         self.select_channel_button = QPushButton("勾选该频道")
         self.select_channel_button.clicked.connect(self._select_channel)
+        self.delete_selected_button = QPushButton("\u5220\u9664\u9009\u4e2d")
+        self.delete_selected_button.setProperty("danger", True)
+        self.delete_selected_button.clicked.connect(self._delete_selected_items)
+        self.enqueue_fallback_button = QPushButton("\u52a0\u5165\u5f85\u515c\u5e95")
+        self.enqueue_fallback_button.setProperty("secondary", True)
+        self.enqueue_fallback_button.clicked.connect(self._enqueue_selected_for_fallback)
         self._queue_control_widgets = (
             self.select_all_button,
             self.invert_selection_button,
-            self.select_first_ten_button,
+            self._select_count_widget,
             self.channel_selection_combo,
             self.select_channel_button,
+            self.enqueue_fallback_button,
+            self.delete_selected_button,
         )
 
         self.audio_strategy_combo = QComboBox()
@@ -1223,12 +1276,30 @@ class MainWindow(QMainWindow):
         self.cover_review_table.setHorizontalHeaderLabels(
             ["标题", "视频 ID", "检测结论", "风险标签", "置信度", "可见依据"]
         )
-        self.cover_review_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.cover_review_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.cover_review_table.setColumnCount(7)
+        self.cover_review_table.setHorizontalHeaderLabels(
+            [
+                "\u9009\u62e9",
+                "\u6807\u9898",
+                "\u89c6\u9891 ID",
+                "\u68c0\u6d4b\u7ed3\u8bba",
+                "\u98ce\u9669\u6807\u7b7e",
+                "\u7f6e\u4fe1\u5ea6",
+                "\u53ef\u89c1\u4f9d\u636e",
+            ]
+        )
         self.cover_review_table.setColumnWidth(0, 180)
         self.cover_review_table.setColumnWidth(1, 115)
         self.cover_review_table.setColumnWidth(2, 90)
         self.cover_review_table.setColumnWidth(3, 150)
         self.cover_review_table.setColumnWidth(4, 70)
+        self.cover_review_table.setColumnWidth(0, 70)
+        self.cover_review_table.setColumnWidth(1, 180)
+        self.cover_review_table.setColumnWidth(2, 115)
+        self.cover_review_table.setColumnWidth(3, 90)
+        self.cover_review_table.setColumnWidth(4, 150)
+        self.cover_review_table.setColumnWidth(5, 70)
         self.cover_review_table.horizontalHeader().setStretchLastSection(True)
         self.task_tabs = QTabWidget()
         queue_page = QWidget()
@@ -1247,6 +1318,7 @@ class MainWindow(QMainWindow):
         self.task_tabs.addTab(fallback_page, "待兜底 (0)")
         self.task_tabs.addTab(cover_review_page, "封面检测 (0)")
         self.task_tabs.setDocumentMode(True)
+        self.task_tabs.currentChanged.connect(self._on_task_tab_changed)
         self.task_tabs.setMinimumHeight(260)
         queue_card_layout.addLayout(self._queue_header_layout)
         queue_card_layout.addWidget(self.task_tabs, 1)
@@ -1477,10 +1549,13 @@ class MainWindow(QMainWindow):
                 self._queue_header_layout.addWidget(widget, 1, column)
             self._queue_header_layout.addWidget(self.channel_selection_combo, 2, 0, 1, 2)
             self._queue_header_layout.addWidget(self.select_channel_button, 2, 2)
+            self._queue_header_layout.addWidget(self.enqueue_fallback_button, 3, 0)
+            self._queue_header_layout.addWidget(self.delete_selected_button, 3, 1)
         else:
             self._queue_header_layout.setColumnStretch(1, 1)
-            for column, widget in enumerate(self._queue_control_widgets, start=2):
+            for column, widget in enumerate(self._queue_control_widgets[:-1], start=2):
                 self._queue_header_layout.addWidget(widget, 0, column)
+            self._queue_header_layout.addWidget(self.delete_selected_button, 0, 1, Qt.AlignmentFlag.AlignRight)
 
     @staticmethod
     def _short_title(title: str, limit: int = 38) -> str:
@@ -1502,53 +1577,71 @@ class MainWindow(QMainWindow):
             row, column = (divmod(index, 2) if compact else (0, index))
             self._workflow_steps_layout.addWidget(step, row, column)
 
-    def _set_busy(self, busy: bool) -> None:
+    def _set_busy(self, busy: bool, *, scope: str = "local") -> None:
+        """Lock only the task lane that is running.
+
+        Matching is a server-side queued task, so its polling thread must not
+        disable local collection, downloading, or subtitle preparation.
+        """
+        local_busy = bool(busy) if scope == "local" else self._thread_is_running()
+        matching_busy = bool(busy) if scope == "matching" else self._matching_thread_is_running()
         self._refresh_dashboard_metrics()
-        self.collect_button.setEnabled(not busy)
+        self.collect_button.setEnabled(not local_busy)
         if hasattr(self, "_download_page"):
-            self._download_page.set_busy(busy)
+            self._download_page.set_busy(local_busy)
         if hasattr(self, "_cover_page"):
-            self._cover_page.set_busy(busy)
+            self._cover_page.set_busy(local_busy)
         if hasattr(self, "_subtitle_page"):
-            self._subtitle_page.set_busy(busy)
+            self._subtitle_page.set_busy(local_busy)
         if hasattr(self, "_matching_page"):
-            self._matching_page.set_busy(busy)
+            self._matching_page.set_busy(matching_busy, submission_blocked=local_busy)
         subtitle_preparing = isinstance(self._thread, _PrepareThread)
         parallel_cover_running = self._parallel_cover_review_is_running()
-        self.cover_button.setEnabled(not busy and bool(self._videos))
+        self.cover_button.setEnabled(not local_busy and bool(self._videos))
         self.cover_review_button.setEnabled(
             not parallel_cover_running
-            and (not busy or subtitle_preparing)
+            and (not local_busy or subtitle_preparing)
             and any(video.video_id in self._cover_paths for video in self._selected_videos())
         )
-        self.prepare_button.setEnabled(not busy and bool(self._videos))
-        self.export_button.setEnabled(not busy and bool(self._ready_items))
-        self.asr_fallback_button.setEnabled(not busy and bool(self._pending_asr))
-        self.auto_asr_fallback_check.setEnabled(not busy)
-        self.caption_concurrency_combo.setEnabled(not busy)
-        self.asr_download_concurrency_combo.setEnabled(not busy)
-        self.asr_transcribe_concurrency_combo.setEnabled(not busy)
-        self.auto_cover_review_check.setEnabled(not busy)
-        self.match_button.setEnabled(not busy and bool(self._ready_items))
+        self.prepare_button.setEnabled(not local_busy and bool(self._videos))
+        self.export_button.setEnabled(not local_busy and bool(self._ready_items))
+        self.asr_fallback_button.setEnabled(
+            not local_busy and bool(self._pending_asr or self._selected_direct_asr_videos())
+        )
+        self.auto_asr_fallback_check.setEnabled(not local_busy)
+        self.skip_caption_probe_check.setEnabled(not local_busy)
+        self.caption_concurrency_combo.setEnabled(not local_busy)
+        self.asr_download_concurrency_combo.setEnabled(not local_busy)
+        self.asr_transcribe_concurrency_combo.setEnabled(not local_busy)
+        self.auto_cover_review_check.setEnabled(not local_busy)
+        self.match_button.setEnabled(not local_busy and not matching_busy and bool(self._ready_items))
         for button in (
             self.select_all_button,
             self.invert_selection_button,
             self.select_first_ten_button,
             self.select_channel_button,
+            self.enqueue_fallback_button,
+            self.delete_selected_button,
         ):
-            button.setEnabled(not busy and bool(self._videos))
-        self.channel_selection_combo.setEnabled(not busy and bool(self._videos))
+            button.setEnabled(not local_busy and bool(self._videos))
+        self.delete_selected_button.setEnabled(
+            not local_busy and bool(self._selection_table().rowCount())
+        )
+        self.channel_selection_combo.setEnabled(not local_busy and bool(self._videos))
+        self.select_count_spin.setEnabled(not local_busy and bool(self._videos))
         self.audio_strategy_combo.setEnabled(False)
-        self.browser_concurrency_combo.setEnabled(not busy and self.audio_strategy_combo.currentData() == "browser")
-        match_thread_ready = isinstance(self._thread, _MatchThread)
-        local_task_active = self._task_control is not None and not self._task_control.cancelled
-        self.pause_button.setEnabled(busy and (local_task_active or match_thread_ready))
-        self.cancel_task_button.setEnabled(busy and (local_task_active or match_thread_ready))
-        self.clear_button.setEnabled(not busy)
-        self.asr_config_button.setEnabled(not busy)
-        self.llm_config_button.setEnabled(not busy)
-        self.youtube_login_button.setEnabled(not busy)
-        if not busy:
+        self.browser_concurrency_combo.setEnabled(
+            not local_busy and self.audio_strategy_combo.currentData() == "browser"
+        )
+        local_task_active = local_busy and self._task_control is not None and not self._task_control.cancelled
+        self.pause_button.setEnabled(local_task_active or matching_busy)
+        self.cancel_task_button.setEnabled(local_task_active or matching_busy)
+        self.clear_button.setEnabled(not local_busy and not matching_busy)
+        self.asr_config_button.setEnabled(not local_busy)
+        self.llm_config_button.setEnabled(not local_busy)
+        self.matching_config_button.setEnabled(not local_busy)
+        self.youtube_login_button.setEnabled(not local_busy)
+        if not local_busy and not matching_busy:
             QTimer.singleShot(120, self._persist_workspace_state)
 
     def _thread_is_running(self) -> bool:
@@ -1565,6 +1658,22 @@ class MainWindow(QMainWindow):
             LOGGER.info("Discarding deleted worker thread reference.")
             self._thread = None
             return False
+
+    def _matching_thread_is_running(self) -> bool:
+        thread = self._matching_thread
+        if thread is None:
+            return False
+        try:
+            return bool(thread.isRunning())
+        except RuntimeError:
+            LOGGER.info("Discarding deleted matching worker thread reference.")
+            self._matching_thread = None
+            return False
+
+    def _finish_matching_thread(self, thread: _MatchThread) -> None:
+        if self._matching_thread is thread:
+            self._matching_thread = None
+        thread.deleteLater()
 
     def _parallel_cover_review_is_running(self) -> bool:
         thread = self._parallel_cover_review_thread
@@ -1723,8 +1832,41 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(150, QApplication.instance().quit)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        local_thread = self._thread
+        if local_thread is not None and local_thread.isRunning():
+            # Keep the durable snapshot active after cancellation so the next
+            # launch can offer recovery.
+            self._closing_for_recovery = True
         if self._parallel_cover_review_control is not None:
             self._parallel_cover_review_control.cancel()
+        parallel_cover_thread = self._parallel_cover_review_thread
+        if parallel_cover_thread is not None and parallel_cover_thread.isRunning():
+            if not parallel_cover_thread.wait(5000):
+                QMessageBox.warning(
+                    self,
+                    "任务仍在停止",
+                    "封面检测正在结束，请稍后再关闭窗口。\n任务状态已保存，可继续恢复。",
+                )
+                event.ignore()
+                return
+
+        # Do not let Qt destroy a local worker while its run() method still
+        # owns network/process resources. This was the source of the native
+        # Qt6Core crash observed after restoring a long ASR task.
+        if local_thread is not None and local_thread.isRunning():
+            if self._task_control is not None:
+                self._task_control.cancel()
+            self._persist_workspace_state()
+            if not local_thread.wait(5000):
+                QMessageBox.warning(
+                    self,
+                    "任务仍在停止",
+                    "当前任务正在结束网络请求，请稍后再关闭窗口。\n任务状态已保存，可继续恢复。",
+                )
+                event.ignore()
+                return
+        if self._matching_thread_is_running():
+            self._matching_thread.request_control("cancel")
         self._persist_workspace_state()
         super().closeEvent(event)
 
@@ -1760,10 +1902,17 @@ class MainWindow(QMainWindow):
             task_kind = "字幕转写"
         elif isinstance(self._thread, _StandaloneCoverThread):
             task_kind = "封面检测"
+        matching_active = self._matching_thread_is_running()
+        if matching_active:
+            task_kind = f"{task_kind} + 匹配核验" if task_kind else "匹配核验"
         parallel_cover_active = self._parallel_cover_review_is_running()
         if parallel_cover_active:
             task_kind = f"{task_kind} + 封面检测" if task_kind else "封面检测"
-        active = self._thread_is_running() or parallel_cover_active
+        active = self._thread_is_running() or matching_active or parallel_cover_active
+        # Do not erase the recovery snapshot when a worker acknowledges
+        # cancellation while the window is closing.
+        if self._closing_for_recovery and (self._videos or self._pending_asr):
+            active = True
         ready_ids = {
             str(item.get("source_video_id") or "")
             for item in self._ready_items
@@ -1795,6 +1944,14 @@ class MainWindow(QMainWindow):
     def _persist_workspace_state(self) -> None:
         if not hasattr(self, "_dashboard_page"):
             return
+        # A newly launched window has no local rows yet. Do not let its close
+        # event overwrite a recoverable snapshot before the startup prompt has
+        # been displayed and answered.
+        if not self._recovery_prompt_shown and not (self._videos or self._pending_asr):
+            existing_state = self._state_store.load()
+            if isinstance(existing_state, dict) and has_recoverable_work(existing_state):
+                LOGGER.info("Preserving recoverable workspace before startup recovery prompt.")
+                return
         snapshot = self._workspace_snapshot()
         download_jobs: list[dict[str, str]] = []
         if hasattr(self, "_download_page"):
@@ -1836,6 +1993,7 @@ class MainWindow(QMainWindow):
             "download_results": self._standalone_download_results,
             "download_jobs": download_jobs,
             "subtitle_jobs": subtitle_jobs,
+            "task_spec": dict(self._task_spec),
         }
         try:
             self._state_store.save(payload)
@@ -1843,11 +2001,17 @@ class MainWindow(QMainWindow):
             LOGGER.warning("Unable to persist workspace state: %s", exc)
 
     def _offer_workspace_recovery(self) -> None:
+        if self._recovery_prompt_shown:
+            return
+        self._recovery_prompt_shown = True
         state = self._state_store.load()
-        if not isinstance(state, dict) or not bool(state.get("active")):
+        if not isinstance(state, dict):
+            return
+        status = str(state.get("status") or "")
+        if not has_recoverable_work(state):
             return
         task_kind = str(state.get("task_kind") or "批处理")
-        status = str(state.get("status") or "上次任务未完成")
+        status = status or "上次任务未完成"
         answer = QMessageBox.question(
             self,
             "检测到未完成任务",
@@ -1860,6 +2024,12 @@ class MainWindow(QMainWindow):
             state["status"] = "用户选择不恢复"
             self._state_store.save(state)
             return
+
+        # Acknowledge recovery before rebuilding the UI. The next snapshot
+        # must describe an active recovery instead of the stale prompt.
+        state["active"] = True
+        state["status"] = "正在恢复上次未完成任务..."
+        self._state_store.save(state)
 
         videos: list[YouTubeVideo] = []
         for raw in state.get("videos") if isinstance(state.get("videos"), list) else []:
@@ -1922,6 +2092,65 @@ class MainWindow(QMainWindow):
             f"已恢复上次任务：视频 {len(self._videos)} 条，可匹配视频字幕 {len(self._ready_items)} 条。"
         )
         self._set_busy(False)
+        self._resume_recovered_task(state)
+
+    def _resume_recovered_task(self, state: dict[str, object]) -> None:
+        """Resume unfinished subtitle work without repeating completed items."""
+        task_kind = str(state.get("task_kind") or "")
+        raw_spec = state.get("task_spec")
+        spec = dict(raw_spec) if isinstance(raw_spec, dict) else {}
+        if spec.get("kind") == "asr_fallback" or "ASR" in task_kind:
+            if self._pending_asr:
+                self.status_label.setText(
+                    f"恢复 ASR 兜底：剩余 {len(self._pending_asr)} 条。"
+                )
+                self._start_asr_thread(list(self._pending_asr), {})
+            else:
+                self._persist_workspace_state()
+            return
+        if spec.get("kind") != "prepare" and "字幕获取" not in task_kind:
+            return
+
+        ready_ids = {
+            str(item.get("source_video_id") or "")
+            for item in self._ready_items
+            if str(item.get("source_video_id") or "")
+        }
+        pending_ids = {
+            str((item.get("video") or {}).get("video_id") or "")
+            for item in self._pending_asr
+            if isinstance(item, dict)
+        }
+        processed_ids = ready_ids | pending_ids
+        remaining = [
+            video for video in self._videos
+            if video.video_id not in processed_ids
+        ]
+        self._resume_auto_asr = bool(spec.get("allow_asr_fallback"))
+
+        if remaining:
+            remaining_ids = {video.video_id for video in remaining}
+            for row, video in enumerate(self._videos):
+                item = self.video_table.item(row, 0)
+                if item is not None:
+                    item.setCheckState(
+                        Qt.CheckState.Checked
+                        if video.video_id in remaining_ids
+                        else Qt.CheckState.Unchecked
+                    )
+            self.status_label.setText(
+                f"恢复字幕任务：剩余 {len(remaining)} 条，已保留 {len(processed_ids)} 条结果。"
+            )
+            self._prepare()
+            return
+
+        if self._resume_auto_asr and self._pending_asr:
+            self.status_label.setText(
+                f"恢复 ASR 兜底：剩余 {len(self._pending_asr)} 条。"
+            )
+            self._start_asr_thread(list(self._pending_asr), {})
+            return
+        self._resume_auto_asr = False
 
     def _navigate_workspace(self, page_id: str) -> None:
         if not hasattr(self, "_page_stack"):
@@ -2089,19 +2318,22 @@ class MainWindow(QMainWindow):
         sources: list[str],
         seconds: int,
         allow_asr_fallback: bool,
+        skip_caption_probe: bool = False,
     ) -> None:
         if self._thread_is_running():
             QMessageBox.information(self, "任务进行中", "请等待当前任务完成，或先暂停/取消当前任务。")
             return
         self._task_control = TaskControl()
         self._set_busy(True)
-        self.status_label.setText(f"正在处理 {len(sources)} 条字幕素材...")
+        mode = "直接下载并 ASR 转写" if skip_caption_probe else "获取字幕并按需转写"
+        self.status_label.setText(f"正在处理 {len(sources)} 条字幕素材（{mode}）...")
         self._subtitle_page.set_status(f"正在处理 0/{len(sources)} 条素材...")
         self._thread = _StandaloneSubtitleThread(
             sources,
             seconds,
             allow_asr_fallback,
             self._task_control,
+            skip_caption_probe=skip_caption_probe,
         )
         self._thread.item_updated.connect(self._on_standalone_subtitle_item)
         self._thread.completed.connect(self._on_standalone_subtitle_completed)
@@ -2228,24 +2460,27 @@ class MainWindow(QMainWindow):
             return
         server, username, password = credentials
         if self._thread_is_running():
+            QMessageBox.information(self, "任务进行中", "请等待本地字幕、下载或封面任务完成后再提交匹配。")
+            return
+        if self._matching_thread_is_running():
             QMessageBox.information(self, "任务进行中", "请等待当前任务完成，或先暂停/取消当前任务。")
             return
         self._match_paused = False
-        self._task_control = None
-        self._set_busy(True)
+        self._set_busy(True, scope="matching")
         items = VerificationWorkflow().coalesce_video_match_items(items)
         source_video_count = len(items)
         submit_message = f"正在提交 {source_video_count} 条视频字幕到匹配服务..."
         self.status_label.setText(submit_message)
         self._matching_page.set_status(submit_message)
         self._active_matching_items = [dict(item) for item in items]
-        self._thread = _MatchThread(items, server, username, password, top_k=top_k)
-        self._thread.task_created.connect(self._on_match_task_created)
-        self._thread.progress.connect(self._on_match_progress)
-        self._thread.succeeded.connect(self._on_matched)
-        self._thread.failed.connect(self._on_worker_failed)
-        self._thread.finished.connect(self._thread.deleteLater)
-        self._thread.start()
+        thread = _MatchThread(items, server, username, password, top_k=top_k)
+        self._matching_thread = thread
+        thread.task_created.connect(self._on_match_task_created)
+        thread.progress.connect(self._on_match_progress)
+        thread.succeeded.connect(self._on_matched)
+        thread.failed.connect(self._on_matching_worker_failed)
+        thread.finished.connect(lambda: self._finish_matching_thread(thread))
+        thread.start()
 
     @staticmethod
     def _matching_source_video_count(items: list[dict[str, object]]) -> int:
@@ -2341,7 +2576,19 @@ class MainWindow(QMainWindow):
         self.channel_selection_combo.blockSignals(False)
 
     def _selection_table(self) -> QTableWidget:
-        return self.fallback_table if self.task_tabs.currentIndex() == 1 else self.video_table
+        if self.task_tabs.currentIndex() == 1:
+            return self.fallback_table
+        if self.task_tabs.currentIndex() == 2:
+            return self.cover_review_table
+        return self.video_table
+
+    def _on_task_tab_changed(self, index: int) -> None:
+        labels = {
+            0: "\u5220\u9664\u9009\u4e2d\u89c6\u9891",
+            1: "\u5220\u9664\u9009\u4e2d\u5f85\u515c\u5e95",
+            2: "\u5220\u9664\u9009\u4e2d\u68c0\u6d4b\u8bb0\u5f55",
+        }
+        self.delete_selected_button.setText(labels.get(index, "\u5220\u9664\u9009\u4e2d"))
 
     def _set_checked_rows(self, checked_rows: set[int]) -> None:
         table = self._selection_table()
@@ -2369,7 +2616,8 @@ class MainWindow(QMainWindow):
 
     def _select_first_ten(self) -> None:
         table = self._selection_table()
-        self._set_checked_rows(set(range(min(10, table.rowCount()))))
+        count = max(1, int(self.select_count_spin.value()))
+        self._set_checked_rows(set(range(min(count, table.rowCount()))))
 
     def _select_channel(self) -> None:
         channel = str(self.channel_selection_combo.currentData() or "").strip()
@@ -2383,21 +2631,236 @@ class MainWindow(QMainWindow):
                 if table.item(row, 3) is not None and table.item(row, 3).text().strip() == channel
             })
             return
+        if table is self.cover_review_table:
+            channel_video_ids = {
+                video.video_id for video in self._videos if video.channel.strip() == channel
+            }
+            self._set_checked_rows({
+                row for row in range(table.rowCount())
+                if table.item(row, 2) is not None
+                and table.item(row, 2).text().strip() in channel_video_ids
+            })
+            return
         self._set_checked_rows({
             row for row, video in enumerate(self._videos) if video.channel.strip() == channel
         })
 
+    def _enqueue_selected_for_fallback(self) -> None:
+        """Move selected videos into the manual ASR fallback queue."""
+        if self._thread_is_running() or self._matching_thread_is_running() or self._parallel_cover_review_is_running():
+            QMessageBox.information(
+                self,
+                "\u4efb\u52a1\u8fdb\u884c\u4e2d",
+                "\u5f53\u524d\u6709\u4efb\u52a1\u6b63\u5728\u4f7f\u7528\u5217\u8868\u6570\u636e\uff0c\u8bf7\u7b49\u4efb\u52a1\u5b8c\u6210\u540e\u518d\u64cd\u4f5c\u3002",
+            )
+            return
+        videos = self._selected_videos()
+        if not videos:
+            QMessageBox.information(self, "\u672a\u9009\u62e9", "\u8bf7\u5148\u5728\u89c6\u9891\u961f\u5217\u4e2d\u52fe\u9009\u8981\u8f6c\u5165\u5f85\u515c\u5e95\u7684\u89c6\u9891\u3002")
+            return
+
+        selected_ids = {video.video_id for video in videos}
+        pending_by_id = {
+            str((item.get("video") or {}).get("video_id") or ""): item
+            for item in self._pending_asr
+        }
+        added_count = 0
+        for video in videos:
+            if video.video_id not in pending_by_id:
+                pending_by_id[video.video_id] = {
+                    "video": video.to_dict(),
+                    "inspection": {
+                        "status": "asr_required",
+                        "asr_status": "pending",
+                        "asr_error": "\u7528\u6237\u624b\u52a8\u9009\u62e9\u8fdb\u5165\u5f85\u515c\u5e95",
+                    },
+                }
+                added_count += 1
+        self._pending_asr = list(pending_by_id.values())
+        self._ready_items = [
+            item for item in self._ready_items
+            if str(item.get("source_video_id") or "") not in selected_ids
+        ]
+        self._refresh_fallback_table()
+        for row in range(self.fallback_table.rowCount()):
+            video_id_item = self.fallback_table.item(row, 2)
+            if video_id_item is not None and video_id_item.text().strip() in selected_ids:
+                check = self.fallback_table.item(row, 0)
+                if check is not None:
+                    check.setCheckState(Qt.CheckState.Checked)
+        self._refresh_table_statuses()
+        self._matching_page.set_items(self._ready_items)
+        self._persist_workspace_state()
+        self.task_tabs.setCurrentIndex(1)
+        self.status_label.setText(
+            f"\u5df2\u5c06 {added_count} \u6761\u89c6\u9891\u52a0\u5165\u5f85\u515c\u5e95\uff0c\u53ef\u5728\u5f85\u515c\u5e95\u9875\u70b9\u51fb\u4e0b\u8f7d\u5e76\u8f6c\u5199\u3002"
+            if added_count
+            else "\u9009\u4e2d\u89c6\u9891\u5df2\u5728\u5f85\u515c\u5e95\u5217\u8868\u4e2d\u3002"
+        )
+
+    def _delete_selected_items(self) -> None:
+        """Remove selected workspace records without deleting source files."""
+        if self._thread_is_running() or self._matching_thread_is_running() or self._parallel_cover_review_is_running():
+            QMessageBox.information(
+                self,
+                "\u4efb\u52a1\u8fdb\u884c\u4e2d",
+                "\u5f53\u524d\u6709\u4efb\u52a1\u6b63\u5728\u4f7f\u7528\u5217\u8868\u6570\u636e\uff0c\u8bf7\u7b49\u4efb\u52a1\u5b8c\u6210\u6216\u53d6\u6d88\u540e\u518d\u5220\u9664\u3002",
+            )
+            return
+
+        index = self.task_tabs.currentIndex()
+        table = self._selection_table()
+        if index == 0:
+            selected_rows = {
+                row for row in range(table.rowCount())
+                if table.item(row, 0) is not None
+                and table.item(row, 0).checkState() == Qt.CheckState.Checked
+            }
+            selected_videos = [
+                video for row, video in enumerate(self._videos) if row in selected_rows
+            ]
+            selected_ids = {video.video_id for video in selected_videos}
+            if not selected_ids:
+                QMessageBox.information(self, "\u672a\u9009\u62e9", "\u8bf7\u5148\u52fe\u9009\u8981\u5220\u9664\u7684\u89c6\u9891\u3002")
+                return
+            selected_urls = {video.source_url for video in selected_videos}
+            prompt = f"\u5c06\u4ece\u5de5\u4f5c\u533a\u79fb\u9664 {len(selected_ids)} \u6761\u89c6\u9891\u53ca\u5176\u5173\u8054\u7684\u5b57\u5e55\u3001\u5c01\u9762\u68c0\u6d4b\u8bb0\u5f55\u548c\u5339\u914d\u8bb0\u5f55\u3002\n\u539f\u59cb\u89c6\u9891\u3001\u97f3\u9891\u548c\u5c01\u9762\u6587\u4ef6\u4e0d\u4f1a\u88ab\u5220\u9664\u3002\n\u662f\u5426\u7ee7\u7eed\uff1f"
+            if QMessageBox.question(
+                self,
+                "\u786e\u8ba4\u5220\u9664\u89c6\u9891",
+                prompt,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
+                return
+
+            self._videos = [video for video in self._videos if video.video_id not in selected_ids]
+            self._ready_items = [
+                item for item in self._ready_items
+                if str(item.get("source_video_id") or "") not in selected_ids
+            ]
+            self._pending_asr = [
+                item for item in self._pending_asr
+                if str((item.get("video") or {}).get("video_id") or "") not in selected_ids
+            ]
+            self._cover_paths = {
+                video_id: path for video_id, path in self._cover_paths.items()
+                if video_id not in selected_ids
+            }
+            self._cover_review_results = [
+                result for result in self._cover_review_results
+                if result.video_id not in selected_ids
+            ]
+            self._matching_result_rows = [
+                row for row in self._matching_result_rows
+                if str(row.get("source_video_id") or row.get("video_id") or "") not in selected_ids
+            ]
+            self._active_matching_items = [
+                item for item in self._active_matching_items
+                if str(item.get("source_video_id") or "") not in selected_ids
+            ]
+            self._active_video_ids.difference_update(selected_ids)
+            self._completed_video_ids.difference_update(selected_ids)
+            self._standalone_download_results = [
+                result for result in self._standalone_download_results
+                if str(result.get("url") or "") not in selected_urls
+            ]
+            for row in sorted(selected_rows, reverse=True):
+                self.video_table.removeRow(row)
+            if not self._videos:
+                self._task_spec = {}
+                self.result_edit.clear()
+            self._refresh_fallback_table()
+            self._refresh_cover_review_table()
+            self._refresh_table_statuses()
+            self._matching_page.set_items(self._ready_items)
+            self._matching_page.set_result_rows(self._matching_result_rows)
+            self._refresh_downloaded_subtitle_import()
+            self._refresh_channel_selector()
+            self._persist_workspace_state()
+            self.status_label.setText(f"\u5df2\u5220\u9664 {len(selected_ids)} \u6761\u89c6\u9891\uff0c\u5176\u4ed6\u539f\u59cb\u6587\u4ef6\u4fdd\u7559\u3002")
+            self._set_busy(False)
+            return
+
+        selected_ids = {
+            str(table.item(row, 2).text() or "")
+            for row in range(table.rowCount())
+            if table.item(row, 0) is not None
+            and table.item(row, 0).checkState() == Qt.CheckState.Checked
+            and table.item(row, 2) is not None
+        }
+        selected_ids.discard("")
+        if not selected_ids:
+            QMessageBox.information(self, "\u672a\u9009\u62e9", "\u8bf7\u5148\u52fe\u9009\u8981\u5220\u9664\u7684\u6761\u76ee\u3002")
+            return
+
+        if index == 1:
+            prompt = f"\u5c06\u4ece\u5f85\u515c\u5e95\u5217\u8868\u79fb\u9664 {len(selected_ids)} \u6761\u8bb0\u5f55\uff0c\u540e\u7eed\u53ef\u91cd\u65b0\u9009\u62e9\u8be5\u89c6\u9891\u8fdb\u884c\u5904\u7406\u3002\n\u662f\u5426\u7ee7\u7eed\uff1f"
+            if QMessageBox.question(
+                self,
+                "\u786e\u8ba4\u5220\u9664\u5f85\u515c\u5e95\u8bb0\u5f55",
+                prompt,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            self._pending_asr = [
+                item for item in self._pending_asr
+                if str((item.get("video") or {}).get("video_id") or "") not in selected_ids
+            ]
+            for row, video in enumerate(self._videos):
+                if video.video_id in selected_ids:
+                    self.video_table.setItem(row, 4, QTableWidgetItem("\u5df2\u79fb\u9664\u515c\u5e95\uff0c\u5f85\u91cd\u65b0\u5904\u7406"))
+            self._refresh_fallback_table()
+            self._refresh_table_statuses()
+            self._persist_workspace_state()
+            self.status_label.setText(f"\u5df2\u5220\u9664 {len(selected_ids)} \u6761\u5f85\u515c\u5e95\u8bb0\u5f55\u3002")
+            self._set_busy(False)
+            return
+
+        prompt = f"\u5c06\u4ece\u5c01\u9762\u68c0\u6d4b\u5217\u8868\u79fb\u9664 {len(selected_ids)} \u6761\u68c0\u6d4b\u8bb0\u5f55\uff0c\u5df2\u4e0b\u8f7d\u7684\u5c01\u9762\u6587\u4ef6\u4ecd\u4f1a\u4fdd\u7559\u5e76\u53ef\u590d\u7528\u3002\n\u662f\u5426\u7ee7\u7eed\uff1f"
+        if QMessageBox.question(
+            self,
+            "\u786e\u8ba4\u5220\u9664\u68c0\u6d4b\u8bb0\u5f55",
+            prompt,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self._cover_review_results = [
+            result for result in self._cover_review_results if result.video_id not in selected_ids
+        ]
+        for row, video in enumerate(self._videos):
+            if video.video_id in selected_ids:
+                status = "\u5df2\u4e0b\u8f7d\uff0c\u5f85\u68c0\u6d4b" if video.video_id in self._cover_paths else "\u5f85\u4e0b\u8f7d"
+                self.video_table.setItem(row, 5, QTableWidgetItem(status))
+        self._refresh_cover_review_table()
+        self._persist_workspace_state()
+        self.status_label.setText(f"\u5df2\u5220\u9664 {len(selected_ids)} \u6761\u5c01\u9762\u68c0\u6d4b\u8bb0\u5f55\uff0c\u5c01\u9762\u6587\u4ef6\u4ecd\u4fdd\u7559\u3002")
+        self._set_busy(False)
+
     def _toggle_pause(self) -> None:
-        if isinstance(self._thread, _MatchThread):
+        sender = self.sender()
+        matching_page_control = sender in {
+            self._matching_page.pause_button,
+            self._matching_page.cancel_button,
+        }
+        matching_control = matching_page_control or (
+            sender is self.pause_button
+            and self._matching_thread_is_running()
+            and not self._thread_is_running()
+        )
+        if matching_control and self._matching_thread_is_running():
+            thread = self._matching_thread
             if self._match_paused:
-                self._thread.request_control("resume")
+                thread.request_control("resume")
                 self._match_paused = False
                 self.pause_button.setText("暂停")
                 self._matching_page.pause_button.setText("暂停")
                 self.status_label.setText("已请求继续视频级匹配，将在当前视频请求结束后继续。")
                 self._matching_page.set_status("已请求继续视频级匹配，将在当前视频请求结束后继续。")
             else:
-                self._thread.request_control("pause")
+                thread.request_control("pause")
                 self._match_paused = True
                 self.pause_button.setText("继续")
                 self._matching_page.pause_button.setText("继续")
@@ -2428,10 +2891,21 @@ class MainWindow(QMainWindow):
                 self._subtitle_page.set_status("将在当前字幕素材处理完成后暂停。")
 
     def _cancel_task(self) -> None:
+        sender = self.sender()
+        matching_page_control = sender in {
+            self._matching_page.pause_button,
+            self._matching_page.cancel_button,
+        }
         if self._parallel_cover_review_control is not None and self._parallel_cover_review_is_running():
-            self._parallel_cover_review_control.cancel()
-        if isinstance(self._thread, _MatchThread):
-            self._thread.request_control("cancel")
+            if not matching_page_control:
+                self._parallel_cover_review_control.cancel()
+        matching_control = matching_page_control or (
+            sender is self.cancel_task_button
+            and self._matching_thread_is_running()
+            and not self._thread_is_running()
+        )
+        if matching_control and self._matching_thread_is_running():
+            self._matching_thread.request_control("cancel")
             self.pause_button.setEnabled(False)
             self.cancel_task_button.setEnabled(False)
             self._matching_page.pause_button.setEnabled(False)
@@ -2714,6 +3188,14 @@ class MainWindow(QMainWindow):
         )
 
     def _refresh_cover_review_table(self) -> None:
+        previous_selection = {
+            str(self.cover_review_table.item(row, 2).text() or "")
+            for row in range(self.cover_review_table.rowCount())
+            if self.cover_review_table.item(row, 0) is not None
+            and self.cover_review_table.item(row, 0).checkState() == Qt.CheckState.Checked
+            and self.cover_review_table.item(row, 2) is not None
+        }
+        use_default_selection = self.cover_review_table.rowCount() == 0
         self.cover_review_table.setRowCount(len(self._cover_review_results))
         labels = {
             "safe": "安全",
@@ -2722,12 +3204,18 @@ class MainWindow(QMainWindow):
             "unknown": "无法判断",
         }
         for row, result in enumerate(self._cover_review_results):
+            check = QTableWidgetItem()
+            if use_default_selection or result.video_id in previous_selection:
+                check.setCheckState(Qt.CheckState.Checked)
+            else:
+                check.setCheckState(Qt.CheckState.Unchecked)
+            self.cover_review_table.setItem(row, 0, check)
             conclusion = "检测失败" if result.error else labels.get(result.overall_risk, "无法判断")
             tags = "、".join(result.risk_tags) if result.risk_tags else "未发现明确标签"
             confidence = "-" if result.error else f"{result.confidence:.0%}"
             evidence = result.error or result.evidence or result.summary or "未返回依据"
             values = (result.title, result.video_id, conclusion, tags, confidence, evidence)
-            for column, value in enumerate(values):
+            for column, value in enumerate(values, start=1):
                 item = QTableWidgetItem(str(value))
                 item.setToolTip(str(value))
                 self.cover_review_table.setItem(row, column, item)
@@ -2775,17 +3263,32 @@ class MainWindow(QMainWindow):
         if not videos:
             QMessageBox.warning(self, "没有选择", "请至少选择一条视频。")
             return
-        self.status_label.setText("正在获取字幕，不下载完整视频...")
+        skip_caption_probe = self.skip_caption_probe_check.isChecked()
+        self.status_label.setText(
+            "正在直接下载音频并 ASR 转写..."
+            if skip_caption_probe
+            else "正在获取字幕，不下载完整视频..."
+        )
         self._active_video_ids = {video.video_id for video in videos}
         self._completed_video_ids = set()
         self._task_control = TaskControl()
         self._set_busy(True)
         auto_asr = self.auto_asr_fallback_check.isChecked()
+        self._task_spec = {
+            "kind": "prepare",
+            "leading_seconds": int(self.seconds_combo.currentData()),
+            "allow_asr_fallback": bool(auto_asr or skip_caption_probe),
+            "skip_caption_probe": bool(skip_caption_probe),
+            "caption_concurrency": int(self.caption_concurrency_combo.currentData()),
+            "download_concurrency": int(self.asr_download_concurrency_combo.currentData()),
+            "asr_concurrency": int(self.asr_transcribe_concurrency_combo.currentData()),
+        }
         self._thread = _PrepareThread(
             videos,
             int(self.seconds_combo.currentData()),
             self._task_control,
-            allow_asr_fallback=auto_asr,
+            allow_asr_fallback=auto_asr or skip_caption_probe,
+            skip_caption_probe=skip_caption_probe,
             caption_concurrency=int(self.caption_concurrency_combo.currentData()),
             download_concurrency=int(self.asr_download_concurrency_combo.currentData()),
             asr_concurrency=int(self.asr_transcribe_concurrency_combo.currentData()),
@@ -2827,6 +3330,11 @@ class MainWindow(QMainWindow):
             message = f"字幕准备完成：{len(ready)} 条可匹配，直出字幕与自动 ASR 兜底均已完成。"
         self.status_label.setText(message)
         self._set_busy(False)
+        if self._resume_auto_asr and self._pending_asr:
+            self._resume_auto_asr = False
+            self._start_asr_thread(list(self._pending_asr), {})
+        else:
+            self._resume_auto_asr = False
         self._refresh_table_statuses()
 
     def _merge_preparation_results(
@@ -2920,6 +3428,7 @@ class MainWindow(QMainWindow):
         inspection: dict[str, object],
     ) -> None:
         self._completed_video_ids.add(video.video_id)
+        self._upsert_preparation_progress(video, inspection)
         if inspection.get("status") == "asr_required":
             status = "转写未完成，待重试" if self.auto_asr_fallback_check.isChecked() else "等待选择下载转写"
         elif inspection.get("source_kind") == "asr":
@@ -2933,6 +3442,33 @@ class MainWindow(QMainWindow):
         phase = "下载并 ASR 转写" if inspection.get("source_kind") == "asr" else "获取直出字幕"
         self.status_label.setText(f"正在{phase}：{index}/{total}，当前 {self._short_title(video.title)}")
 
+    def _upsert_preparation_progress(
+        self,
+        video: YouTubeVideo,
+        inspection: dict[str, object],
+    ) -> None:
+        """Keep each completed subtitle inspection durable during a batch."""
+        video_id = video.video_id
+        self._ready_items = [
+            item for item in self._ready_items
+            if str(item.get("source_video_id") or "") != video_id
+        ]
+        self._pending_asr = [
+            item for item in self._pending_asr
+            if str((item.get("video") or {}).get("video_id") or "") != video_id
+        ]
+        if inspection.get("status") == "asr_required":
+            self._pending_asr.append(
+                {"video": video.to_dict(), "inspection": dict(inspection)}
+            )
+        else:
+            workflow = VerificationWorkflow()
+            self._ready_items.append(workflow._build_video_match_item(video, inspection))  # noqa: SLF001
+        self._ready_items = VerificationWorkflow().coalesce_video_match_items(self._ready_items)
+        self._matching_page.set_items(self._ready_items)
+        self._refresh_fallback_table()
+        self._persist_workspace_state()
+
     def _on_asr_stage(self, message: str) -> None:
         """Keep long ASR batches observable between per-video completion events."""
         self.status_label.setText(message)
@@ -2940,6 +3476,10 @@ class MainWindow(QMainWindow):
             self._dashboard_page.refresh(self._workspace_snapshot())
         if hasattr(self, "_task_center_page"):
             self._task_center_page.refresh(self._workspace_snapshot())
+        # Download stages happen before per-video ASR results exist. Persist
+        # them so a restart does not appear stuck at 0/N.
+        if not self._state_persist_timer.isActive():
+            self._state_persist_timer.start(300)
 
     def _offer_asr_fallback(self, pending_asr: list[dict[str, object]]) -> None:
         if not pending_asr:
@@ -2956,7 +3496,30 @@ class MainWindow(QMainWindow):
             self._prepare_asr_fallback()
 
     def _prepare_asr_fallback(self) -> None:
+        if not YouTubeAsrService().is_ready():
+            message = "ASR 尚未配置或没有可用的 API 密钥，未开始下载。请先打开“ASR 配置”并测试可用性。"
+            self.status_label.setText(message)
+            if hasattr(self, "_subtitle_page"):
+                self._subtitle_page.set_status(message)
+            QMessageBox.warning(self, "ASR 未配置", message)
+            return
         pending_items = self._selected_pending_asr_items()
+        if not pending_items:
+            existing_pending = {
+                str((item.get("video") or {}).get("video_id") or ""): item
+                for item in self._pending_asr
+            }
+            pending_items = [
+                existing_pending.get(video.video_id)
+                or {
+                    "video": video.to_dict(),
+                    "inspection": VerificationWorkflow.asr_required_inspection(
+                        video,
+                        int(self.seconds_combo.currentData()),
+                    ),
+                }
+                for video in self._selected_direct_asr_videos()
+            ]
         if not pending_items:
             QMessageBox.information(self, "无需转写", "当前勾选的视频没有需要下载转写的条目。")
             return
@@ -2983,6 +3546,18 @@ class MainWindow(QMainWindow):
             return
         self._start_asr_thread(pending_items, {})
 
+    def _selected_direct_asr_videos(self) -> list[YouTubeVideo]:
+        """Return selected videos that do not already have usable subtitles."""
+        ready_ids = {
+            str(item.get("source_video_id") or "")
+            for item in self._ready_items
+            if str(item.get("source_video_id") or "")
+        }
+        return [
+            video for video in self._selected_videos()
+            if video.video_id not in ready_ids
+        ]
+
     def _on_browser_capture_finished(
         self,
         pending_items: list[dict[str, object]],
@@ -2995,7 +3570,21 @@ class MainWindow(QMainWindow):
 
     def _start_asr_thread(self, pending_items: list[dict[str, object]], audio_sources: dict[str, str]) -> None:
         self._completed_video_ids = set()
+        # Recovery enters here directly, without the normal button handler.
+        # Keep result merging correct for both entry points.
+        self._active_video_ids = {
+            str((item.get("video") or {}).get("video_id") or "")
+            for item in pending_items
+            if isinstance(item, dict)
+            and str((item.get("video") or {}).get("video_id") or "")
+        }
         self._task_control = TaskControl()
+        self._task_spec = {
+            "kind": "asr_fallback",
+            "leading_seconds": int(self.seconds_combo.currentData()),
+            "download_concurrency": int(self.asr_download_concurrency_combo.currentData()),
+            "asr_concurrency": int(self.asr_transcribe_concurrency_combo.currentData()),
+        }
         self._set_busy(True)
         self._thread = _AsrFallbackThread(
             pending_items,
@@ -3012,6 +3601,7 @@ class MainWindow(QMainWindow):
         self._thread.failed.connect(self._on_worker_failed)
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
+        self._persist_workspace_state()
 
     def _on_asr_progress(
         self,
@@ -3021,6 +3611,7 @@ class MainWindow(QMainWindow):
         inspection: dict[str, object],
     ) -> None:
         self._completed_video_ids.add(video.video_id)
+        self._upsert_preparation_progress(video, inspection)
         status = "转写已完成" if inspection.get("status") != "asr_required" else "转写失败，待重试"
         for row, item in enumerate(self._videos):
             if item.video_id == video.video_id:
@@ -3055,9 +3646,19 @@ class MainWindow(QMainWindow):
     ) -> None:
         self._merge_preparation_results(ready, pending_asr)
         self._refresh_table_statuses()
-        self.status_label.setText(
-            f"兜底转写完成：新增 {len(ready)} 条可匹配视频字幕，仍有 {len(pending_asr)} 条未完成。"
+        not_configured = bool(pending_asr) and all(
+            str((item.get("inspection") or {}).get("asr_status") or "") == "not_configured"
+            for item in pending_asr
         )
+        if not_configured:
+            message = f"ASR 未配置，未开始下载；仍有 {len(pending_asr)} 条待处理。"
+        else:
+            message = f"兜底转写完成：新增 {len(ready)} 条可匹配视频字幕，仍有 {len(pending_asr)} 条未完成。"
+        self.status_label.setText(message)
+        if hasattr(self, "_subtitle_page"):
+            self._subtitle_page.set_status(message)
+        if not_configured:
+            QMessageBox.warning(self, "未开始兜底转写", "请先配置并测试 ASR 服务，再重新点击“下载并转写兜底”。")
         self._set_busy(False)
 
     def _export_subtitles(self) -> None:
@@ -3147,32 +3748,35 @@ class MainWindow(QMainWindow):
         if credentials is None:
             return
         server, username, password = credentials
+        if self._thread_is_running() or self._matching_thread_is_running():
+            QMessageBox.information(self, "任务进行中", "请等待当前本地任务或匹配任务完成后再提交匹配。")
+            return
         self._match_paused = False
-        self._task_control = None
-        self._set_busy(True)
+        self._set_busy(True, scope="matching")
         submit_message = f"正在提交已勾选的 {len(selected_items)} 条视频字幕到匹配服务..."
         self.status_label.setText(submit_message)
         self._matching_page.set_status(submit_message)
         self._active_matching_items = [dict(item) for item in selected_items]
-        self._thread = _MatchThread(
+        thread = _MatchThread(
             selected_items,
             server,
             username,
             password,
         )
-        self._thread.task_created.connect(self._on_match_task_created)
-        self._thread.progress.connect(self._on_match_progress)
-        self._thread.succeeded.connect(self._on_matched)
-        self._thread.failed.connect(self._on_worker_failed)
-        self._thread.finished.connect(self._thread.deleteLater)
-        self._thread.start()
+        self._matching_thread = thread
+        thread.task_created.connect(self._on_match_task_created)
+        thread.progress.connect(self._on_match_progress)
+        thread.succeeded.connect(self._on_matched)
+        thread.failed.connect(self._on_matching_worker_failed)
+        thread.finished.connect(lambda: self._finish_matching_thread(thread))
+        thread.start()
 
     def _on_match_task_created(self, task_id: str) -> None:
-        message = f"匹配任务已提交：{task_id[:12]}...，正在读取服务端排队状态。"
+        message = f"匹配任务已提交：{task_id[:12]}...，正在读取服务端排队状态；可继续获取字幕或下载素材。"
         self.status_label.setText(message)
         if hasattr(self, "_matching_page"):
             self._matching_page.set_status(message)
-        self._set_busy(True)
+        self._set_busy(True, scope="matching")
 
     def _on_match_progress(self, detail: dict[str, object]) -> None:
         task = detail.get("task") if isinstance(detail.get("task"), dict) else {}
@@ -3252,7 +3856,6 @@ class MainWindow(QMainWindow):
             self._matching_page.set_result_rows(result_rows)
         task = detail.get("task") if isinstance(detail.get("task"), dict) else {}
         status = str(task.get("status") or "completed").lower()
-        self._task_control = None
         self._match_paused = False
         self.pause_button.setText("暂停")
         if status in {"cancelled", "canceled"}:
@@ -3264,20 +3867,26 @@ class MainWindow(QMainWindow):
         self.status_label.setText(message)
         if hasattr(self, "_matching_page"):
             self._matching_page.set_status(message)
-        self._set_busy(False)
+        self._set_busy(False, scope="matching")
+
+    def _on_matching_worker_failed(self, message: str) -> None:
+        self._match_paused = False
+        self.pause_button.setText("暂停")
+        self.status_label.setText("匹配任务失败")
+        if hasattr(self, "_matching_page"):
+            self._matching_page.set_status(f"匹配任务失败：{message}")
+        self._set_busy(False, scope="matching")
+        QMessageBox.critical(self, "匹配失败", message)
 
     def _on_worker_failed(self, message: str) -> None:
         self._task_control = None
-        self._match_paused = False
         self.pause_button.setText("暂停")
         self.status_label.setText("任务失败")
         if hasattr(self, "_download_page"):
             self._download_page.set_status(f"任务失败：{message}")
         if hasattr(self, "_subtitle_page"):
             self._subtitle_page.set_status(f"任务失败：{message}")
-        if hasattr(self, "_matching_page"):
-            self._matching_page.set_status(f"任务失败：{message}")
-        self._set_busy(False)
+        self._set_busy(False, scope="local")
         QMessageBox.critical(self, "处理失败", message)
 
     def _clear(self) -> None:
@@ -3456,7 +4065,27 @@ class MainWindow(QMainWindow):
 
 def run() -> int:
     app = QApplication.instance() or QApplication([])
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    # Recovery must be single-owner. Without a process lock, launching the
+    # VBS twice lets both windows consume the same session_state.json and
+    # multiply yt-dlp/Node workers until Windows starts rejecting cmd/node.
+    app_lock = QLockFile(str(RUNTIME_DIR / "application.lock"))
+    app_lock.setStaleLockTime(10_000)
+    if not app_lock.tryLock(0):
+        QMessageBox.warning(
+            None,
+            "素材分析助手已在运行",
+            "已有一个素材分析助手实例正在运行。\n请关闭已有窗口后再启动，避免重复恢复同一批任务。",
+        )
+        return 1
     apply_app_theme(app)
     window = MainWindow()
     window.show()
-    return app.exec()
+    # Wait until the window is visible before opening a modal dialog. Showing
+    # it from MainWindow.__init__ can race the first event-loop turn and leave
+    # the recovery prompt hidden behind the startup window on some systems.
+    QTimer.singleShot(250, window._offer_workspace_recovery)
+    try:
+        return app.exec()
+    finally:
+        app_lock.unlock()

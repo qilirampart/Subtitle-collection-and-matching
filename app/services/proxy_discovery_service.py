@@ -5,6 +5,8 @@ import re
 import subprocess
 from dataclasses import dataclass
 
+from app.utils.ffmpeg import _hidden_process_kwargs
+
 
 @dataclass(frozen=True)
 class ProxyCandidate:
@@ -100,6 +102,7 @@ class ProxyDiscoveryService:
                 errors="replace",
                 timeout=3,
                 check=False,
+                **_hidden_process_kwargs(),
             )
         except (OSError, subprocess.SubprocessError):
             return []

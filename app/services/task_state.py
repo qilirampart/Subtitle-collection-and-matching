@@ -26,6 +26,10 @@ def has_recoverable_work(payload: dict[str, Any]) -> bool:
     if pending_items:
         return True
 
+    cover_queue = payload.get("cover_queue_items")
+    if isinstance(cover_queue, list) and cover_queue:
+        return True
+
     task_spec = payload.get("task_spec")
     videos = payload.get("videos")
     if not isinstance(task_spec, dict) or not isinstance(videos, list) or not videos:

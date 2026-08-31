@@ -186,6 +186,47 @@ class _CollectThread(QThread):
             self.failed.emit(str(exc))
 
 
+class _CoverCollectThread(QThread):
+    """Collect multiple channel video lists for the independent cover page."""
+
+    progress = Signal(int, int, str, int, object)
+    batch = Signal(object)
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, urls: list[str], limit: int) -> None:
+        super().__init__()
+        self.urls = urls
+        self.limit = limit
+
+    def run(self) -> None:
+        collected: list[dict[str, object]] = []
+        seen_ids: set[str] = set()
+        collector = VerificationWorkflow().collector
+        total = len(self.urls)
+        for index, url in enumerate(self.urls, start=1):
+            try:
+                videos = collector.collect_channel(url, max_items=self.limit)
+                added = 0
+                for video in videos:
+                    if video.video_id in seen_ids:
+                        continue
+                    seen_ids.add(video.video_id)
+                    collected.append({
+                        "video": video.to_dict(),
+                        "collection_status": "success",
+                        "cover_status": "pending",
+                        "review_status": "pending",
+                    })
+                    added += 1
+                if added:
+                    self.batch.emit(collected[-added:])
+                self.progress.emit(index, total, url, added, "")
+            except Exception as exc:  # noqa: BLE001
+                self.progress.emit(index, total, url, 0, str(exc))
+        self.succeeded.emit(collected)
+
+
 class _UpdateCheckThread(QThread):
     completed = Signal(object)
     failed = Signal(str)
@@ -886,6 +927,7 @@ class MainWindow(QMainWindow):
         self._matching_thread: _MatchThread | None = None
         self._parallel_cover_review_thread: _CoverReviewThread | None = None
         self._parallel_cover_review_control: TaskControl | None = None
+        self._cover_collect_thread: _CoverCollectThread | None = None
         self._evidence_thread: _EvidenceContextThread | None = None
         self._youtube_login_dialog: YouTubeLoginDialog | None = None
         self._browser_capture_dialog: BrowserAudioCaptureDialog | None = None
@@ -1382,6 +1424,9 @@ class MainWindow(QMainWindow):
         )
         self._cover_page = CoverPage(
             import_videos=self._import_cover_items,
+            collect_channels=self._collect_cover_channels,
+            start_review=self._start_cover_page_review,
+            remove_items=self._remove_cover_queue_items,
             start_cover=self._start_standalone_cover,
             pause_cover=self._toggle_pause,
             cancel_cover=self._cancel_task,
@@ -1590,7 +1635,10 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_download_page"):
             self._download_page.set_busy(local_busy)
         if hasattr(self, "_cover_page"):
-            self._cover_page.set_busy(local_busy)
+            self._cover_page.set_busy(
+                local_busy,
+                allow_review=local_busy and self._task_control is not None and self._task_control.paused,
+            )
         if hasattr(self, "_subtitle_page"):
             self._subtitle_page.set_busy(local_busy)
         if hasattr(self, "_matching_page"):
@@ -1949,7 +1997,8 @@ class MainWindow(QMainWindow):
         # been displayed and answered.
         if not self._recovery_prompt_shown and not (self._videos or self._pending_asr):
             existing_state = self._state_store.load()
-            if isinstance(existing_state, dict) and has_recoverable_work(existing_state):
+            current_cover_items = self._cover_page.items if hasattr(self, "_cover_page") else []
+            if isinstance(existing_state, dict) and has_recoverable_work(existing_state) and not current_cover_items:
                 LOGGER.info("Preserving recoverable workspace before startup recovery prompt.")
                 return
         snapshot = self._workspace_snapshot()
@@ -1990,6 +2039,7 @@ class MainWindow(QMainWindow):
             "pending_asr": self._pending_asr,
             "cover_paths": self._cover_paths,
             "cover_review_results": [result.to_dict() for result in self._cover_review_results],
+            "cover_queue_items": self._cover_page.items if hasattr(self, "_cover_page") else [],
             "download_results": self._standalone_download_results,
             "download_jobs": download_jobs,
             "subtitle_jobs": subtitle_jobs,
@@ -2054,6 +2104,9 @@ class MainWindow(QMainWindow):
         self._pending_asr = list(raw_pending) if isinstance(raw_pending, list) else []
         raw_cover_paths = state.get("cover_paths")
         self._cover_paths = dict(raw_cover_paths) if isinstance(raw_cover_paths, dict) else {}
+        raw_cover_queue = state.get("cover_queue_items")
+        if hasattr(self, "_cover_page") and isinstance(raw_cover_queue, list):
+            self._cover_page.set_items([item for item in raw_cover_queue if isinstance(item, dict)])
         self._standalone_download_results = (
             list(state.get("download_results"))
             if isinstance(state.get("download_results"), list)
@@ -2232,6 +2285,41 @@ class MainWindow(QMainWindow):
             for video in videos
         ]
 
+    def _collect_cover_channels(self, urls: list[str], limit: int) -> None:
+        if self._thread_is_running() or self._cover_collect_thread is not None and self._cover_collect_thread.isRunning():
+            self._cover_page.set_status("已有任务正在运行，请等待完成或先取消。")
+            return
+        self._cover_page.set_busy(True)
+        self._cover_page.set_status(f"正在采集频道：0/{len(urls)}...")
+        thread = _CoverCollectThread(urls, limit)
+        self._cover_collect_thread = thread
+        thread.progress.connect(
+            lambda index, total, url, added, error: self._cover_page.set_status(
+                f"采集频道：{index}/{total}，本频道新增 {added} 条" + (f"；失败：{error}" if error else "")
+            )
+        )
+        thread.batch.connect(self._on_cover_channel_batch)
+        thread.succeeded.connect(self._on_cover_channels_collected)
+        thread.failed.connect(lambda error: self._cover_page.set_status(f"频道采集失败：{error}"))
+        thread.finished.connect(lambda: self._finish_cover_collection(thread))
+        thread.start()
+
+    def _finish_cover_collection(self, thread: _CoverCollectThread) -> None:
+        if self._cover_collect_thread is thread:
+            self._cover_collect_thread = None
+        self._cover_page.set_busy(False)
+
+    def _on_cover_channels_collected(self, items: list[dict[str, object]]) -> None:
+        if not self._cover_page.items:
+            self._cover_page.set_items(items)
+        self._cover_page.set_status(f"频道采集完成：共获得 {len(items)} 条视频，可选择后下载封面。")
+
+    def _on_cover_channel_batch(self, items: list[dict[str, object]]) -> None:
+        if not isinstance(items, list) or not items:
+            return
+        self._cover_page.append_items([item for item in items if isinstance(item, dict)])
+        self._persist_workspace_state()
+
     def _start_standalone_cover(
         self,
         items: list[dict[str, object]],
@@ -2253,14 +2341,51 @@ class MainWindow(QMainWindow):
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
+    def _start_cover_page_review(self, items: list[dict[str, object]]) -> None:
+        videos: list[YouTubeVideo] = []
+        for item in items:
+            raw = item.get("video") if isinstance(item.get("video"), dict) else item
+            cover_path = str(item.get("cover_path") or "").strip()
+            if not isinstance(raw, dict) or not cover_path:
+                continue
+            try:
+                video = YouTubeVideo(**raw)
+                # Restored independent cover queues may contain the durable
+                # path even when the legacy global map was not rebuilt.
+                self._cover_paths[video.video_id] = cover_path
+                videos.append(video)
+            except TypeError:
+                continue
+        if not videos:
+            self._cover_page.set_status("没有可检测的已下载封面。")
+            return
+        if self._parallel_cover_review_is_running():
+            self._cover_page.set_status("已有封面检测任务正在运行。")
+            return
+        self._start_parallel_cover_review(videos)
+
+    def _remove_cover_queue_items(self, video_ids: set[str]) -> None:
+        ids = {str(video_id or "") for video_id in video_ids if str(video_id or "")}
+        if not ids:
+            return
+        self._cover_paths = {
+            video_id: path for video_id, path in self._cover_paths.items() if video_id not in ids
+        }
+        self._cover_review_results = [
+            result for result in self._cover_review_results if result.video_id not in ids
+        ]
+        self._refresh_cover_review_table()
+        self._persist_workspace_state()
+
     def _on_standalone_cover_item(self, row: int, status: str, cover_path: str, result: object) -> None:
         self._cover_page.update_job(row, status, cover_path, result)
+        self._cover_page.refresh_stage_views()
         total = self._cover_page.item_table.rowCount()
         finished = sum(
             1
             for index in range(total)
-            if (item := self._cover_page.item_table.item(index, 3)) is not None
-            and item.text() in {"处理完成", "封面已获取", "封面失败", "检测失败"}
+            if (item := self._cover_page.item_table.item(index, 6)) is not None
+            and item.text() in {"处理完成", "completed", "检测失败", "review_failed"}
         )
         message = f"封面处理：{finished}/{total}，当前第 {row + 1} 条 {status}"
         self.status_label.setText(message)
@@ -2301,6 +2426,8 @@ class MainWindow(QMainWindow):
                 except (TypeError, ValueError):
                     pass
         self._refresh_cover_review_table()
+        self._cover_page.refresh_stage_views()
+        self._cover_page.set_items(self._cover_page.items)
         self._task_control = None
         self._cover_page.pause_button.setText("暂停")
         message = (
@@ -3143,6 +3270,9 @@ class MainWindow(QMainWindow):
                 self.video_table.setItem(row, 5, QTableWidgetItem("已检测" if not result.error else "检测失败"))
                 break
         self._refresh_cover_review_table()
+        if hasattr(self, "_cover_page"):
+            self._cover_page.update_review_by_video_id(video.video_id, result)
+            self._cover_page.set_status(f"封面检测：{index}/{total}，当前完成 {video.title}")
         self._set_cover_progress(index, total, "封面检测（与字幕同步）")
 
     def _on_parallel_cover_review_finished(

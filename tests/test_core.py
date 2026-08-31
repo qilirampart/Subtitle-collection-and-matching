@@ -37,7 +37,7 @@ from app.services.task_state import TaskStateStore, has_recoverable_work
 from app.services.update_service import ApplicationUpdateService, UpdateError, is_newer_version, version_key
 from app.services.youtube_audio_service import YouTubeAudioService
 from app.task_control import TaskControl
-from app.ui.workspace_pages import MatchingPage
+from app.ui.workspace_pages import MatchingPage, _channel_urls_from_file
 from app.workflow import VerificationWorkflow
 from updater.app_updater import update_windows
 
@@ -52,6 +52,28 @@ class YouTubeCollectorTests(unittest.TestCase):
             YouTubeCollector.normalize_channel_url("https://www.youtube.com/@example"),
             "https://www.youtube.com/@example/videos",
         )
+
+
+class ChannelListImportTests(unittest.TestCase):
+    def test_imports_and_deduplicates_urls_from_csv(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "channels.csv"
+            path.write_text("name,url\nA,https://www.youtube.com/@a\nB,https://www.youtube.com/@a\n", encoding="utf-8")
+            self.assertEqual(_channel_urls_from_file(path), ["https://www.youtube.com/@a"])
+
+    def test_imports_urls_from_xlsx(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "channels.xlsx"
+            workbook = load_workbook(path, read_only=False) if path.exists() else None
+            if workbook is None:
+                from openpyxl import Workbook
+                workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["频道", "链接"])
+            sheet.append(["A", "https://www.youtube.com/@a"])
+            workbook.save(path)
+            workbook.close()
+            self.assertEqual(_channel_urls_from_file(path), ["https://www.youtube.com/@a"])
 
     def test_parses_srt_cues(self) -> None:
         cues = YouTubeCollector.srt_cues(

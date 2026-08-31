@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import csv
 from collections.abc import Callable
 from difflib import SequenceMatcher
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPixmap, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QFileDialog,
     QFormLayout,
@@ -19,10 +23,12 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QMessageBox,
     QSpinBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -30,6 +36,178 @@ from PySide6.QtWidgets import (
 
 
 Navigate = Callable[[str], None]
+
+
+def _channel_urls_from_file(path: Path) -> list[str]:
+    """Read channel URL candidates from text, CSV, or Excel files."""
+    suffix = path.suffix.lower()
+    values: list[str] = []
+    if suffix == ".xlsx":
+        try:
+            from openpyxl import load_workbook
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError("导入 Excel 需要安装 openpyxl。") from exc
+        workbook = load_workbook(path, read_only=True, data_only=True)
+        try:
+            for row in workbook.active.iter_rows(values_only=True):
+                values.extend(str(value).strip() for value in row if value is not None)
+        finally:
+            workbook.close()
+    elif suffix == ".csv":
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.reader(handle):
+                values.extend(str(value).strip() for value in row)
+    else:
+        values = path.read_text(encoding="utf-8-sig").splitlines()
+    urls: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        candidate = str(value or "").strip()
+        if not candidate or "youtube.com" not in candidate.lower() and "youtu.be" not in candidate.lower():
+            continue
+        if candidate not in seen:
+            seen.add(candidate)
+            urls.append(candidate)
+    return urls
+
+
+class ChannelListDialog(QDialog):
+    """Editable channel list that always keeps one trailing blank row."""
+
+    def __init__(self, urls: list[str] | None = None, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("频道清单")
+        self.resize(820, 560)
+        root = QVBoxLayout(self)
+        hint = QLabel("每行填写一个 YouTube 频道链接。填写最后一行后会自动新增空行，也可批量导入文件。")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        actions = QHBoxLayout()
+        import_button = QPushButton("批量导入 TXT / CSV / Excel")
+        import_button.setProperty("secondary", True)
+        import_button.clicked.connect(self._import_file)
+        remove_button = QPushButton("删除选中行")
+        remove_button.setProperty("secondary", True)
+        remove_button.clicked.connect(self._remove_selected_rows)
+        clear_button = QPushButton("清空")
+        clear_button.setProperty("danger", True)
+        clear_button.clicked.connect(self._clear)
+        actions.addWidget(import_button)
+        actions.addWidget(remove_button)
+        actions.addWidget(clear_button)
+        actions.addStretch(1)
+        root.addLayout(actions)
+
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["序号", "频道链接"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.itemChanged.connect(self._on_item_changed)
+        root.addWidget(self.table, 1)
+
+        self.summary_label = QLabel()
+        root.addWidget(self.summary_label)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确认使用")
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+        self._replace_urls(urls or [])
+
+    def urls(self) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 1)
+            value = item.text().strip() if item is not None else ""
+            if value and value not in seen:
+                seen.add(value)
+                result.append(value)
+        return result
+
+    def _replace_urls(self, urls: list[str]) -> None:
+        self.table.blockSignals(True)
+        self.table.setRowCount(0)
+        for url in urls:
+            self._append_row(str(url or "").strip())
+        self._append_row("")
+        self.table.blockSignals(False)
+        self._renumber()
+        self._update_summary()
+
+    def _append_row(self, value: str) -> None:
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        number = QTableWidgetItem(str(row + 1))
+        number.setFlags(number.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.table.setItem(row, 0, number)
+        self.table.setItem(row, 1, QTableWidgetItem(value))
+
+    def _on_item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() != 1:
+            return
+        if item.row() == self.table.rowCount() - 1 and item.text().strip():
+            self.table.blockSignals(True)
+            self._append_row("")
+            self.table.blockSignals(False)
+        self._renumber()
+        self._update_summary()
+
+    def _renumber(self) -> None:
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item is not None:
+                item.setText(str(row + 1))
+
+    def _update_summary(self) -> None:
+        values = []
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 1)
+            value = item.text().strip() if item is not None else ""
+            if value:
+                values.append(value)
+        self.summary_label.setText(f"已填写 {len(values)} 条，去重后 {len(dict.fromkeys(values))} 条")
+
+    def _import_file(self) -> None:
+        file_name, _ = QFileDialog.getOpenFileName(
+            self,
+            "导入频道清单",
+            "",
+            "频道清单 (*.txt *.csv *.xlsx);;文本文件 (*.txt);;CSV 文件 (*.csv);;Excel 文件 (*.xlsx)",
+        )
+        if not file_name:
+            return
+        try:
+            imported = _channel_urls_from_file(Path(file_name))
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "导入失败", str(exc))
+            return
+        if not imported:
+            QMessageBox.information(self, "没有频道链接", "文件中没有识别到 YouTube 频道链接。")
+            return
+        existing = self.urls()
+        self._replace_urls(list(dict.fromkeys(existing + imported)))
+        self.summary_label.setText(f"已导入 {len(imported)} 条；当前去重后共 {len(self.urls())} 条")
+
+    def _remove_selected_rows(self) -> None:
+        rows = sorted({index.row() for index in self.table.selectedIndexes()}, reverse=True)
+        for row in rows:
+            self.table.removeRow(row)
+        values = self.urls()
+        self._replace_urls(values)
+
+    def _clear(self) -> None:
+        self._replace_urls([])
+
+    def _accept(self) -> None:
+        if not self.urls():
+            QMessageBox.information(self, "频道清单为空", "请至少填写或导入一个频道链接。")
+            return
+        self.accept()
 
 
 def _section_title(title: str, hint: str = "") -> QWidget:
@@ -1160,6 +1338,9 @@ class CoverPage(QWidget):
         self,
         *,
         import_videos: Callable[[], list[dict[str, object]]],
+        collect_channels: Callable[[list[str], int], None],
+        start_review: Callable[[list[dict[str, object]]], None],
+        remove_items: Callable[[set[str]], None],
         start_cover: Callable[[list[dict[str, object]], bool, bool], None],
         pause_cover: Callable[[], None],
         cancel_cover: Callable[[], None],
@@ -1168,11 +1349,18 @@ class CoverPage(QWidget):
     ) -> None:
         super().__init__(parent)
         self._import_videos = import_videos
+        self._collect_channels = collect_channels
+        self._start_review = start_review
+        self._remove_items_callback = remove_items
         self._start_cover = start_cover
         self._export_reviews = export_reviews
         self._items: list[dict[str, object]] = []
         self._review_details: dict[int, dict[str, object]] = {}
         self._cover_preview_pixmap: QPixmap | None = None
+        self._selection_buttons: list[QPushButton] = []
+        self._channel_urls: list[str] = []
+        self._visible_indices: list[int] = []
+        self._queue_tab_index = 0
         root = QVBoxLayout(self)
         root.setContentsMargins(26, 24, 26, 26)
         root.setSpacing(14)
@@ -1180,21 +1368,41 @@ class CoverPage(QWidget):
 
         source_card = QFrame()
         source_card.setObjectName("WorkspaceCard")
-        source_layout = QHBoxLayout(source_card)
+        source_layout = QVBoxLayout(source_card)
         source_layout.setContentsMargins(16, 14, 16, 14)
+        input_row = QHBoxLayout()
+        self.manage_channels_button = QPushButton("管理频道清单")
+        self.manage_channels_button.setProperty("secondary", True)
+        self.manage_channels_button.clicked.connect(self._open_channel_dialog)
+        input_row.addWidget(self.manage_channels_button)
+        self.channel_count_label = QLabel("尚未添加频道")
+        self.channel_count_label.setObjectName("PageHint")
+        input_row.addWidget(self.channel_count_label, 1)
+        input_row.addWidget(QLabel("每频道最多"))
+        self.channel_limit_spin = QSpinBox()
+        self.channel_limit_spin.setRange(0, 10000)
+        self.channel_limit_spin.setValue(0)
+        self.channel_limit_spin.setSpecialValueText("全部")
+        self.channel_limit_spin.setToolTip("每个频道最多采集多少条视频；0 表示全部")
+        input_row.addWidget(self.channel_limit_spin)
+        self.collect_button = QPushButton("采集频道视频")
+        self.collect_button.setProperty("secondary", True)
+        self.collect_button.clicked.connect(self._collect_channel_videos)
+        input_row.addWidget(self.collect_button)
+        source_layout.addLayout(input_row)
+        action_row = QHBoxLayout()
         import_button = QPushButton("从采集结果导入")
         import_button.setProperty("secondary", True)
         import_button.clicked.connect(self._load_videos)
-        source_layout.addWidget(import_button)
+        action_row.addWidget(import_button)
         self.download_check = QCheckBox("自动获取封面")
         self.download_check.setChecked(True)
         self.detect_check = QCheckBox("获取后检测封面")
         self.detect_check.setChecked(True)
-        source_layout.addWidget(self.download_check)
-        source_layout.addWidget(self.detect_check)
-        source_layout.addStretch(1)
+        action_row.addStretch(1)
         self.item_count_label = QLabel("当前 0 条")
-        source_layout.addWidget(self.item_count_label)
+        action_row.addWidget(self.item_count_label)
+        source_layout.addLayout(action_row)
         root.addWidget(source_card)
 
         queue_card = QFrame()
@@ -1202,16 +1410,50 @@ class CoverPage(QWidget):
         queue_layout = QVBoxLayout(queue_card)
         queue_layout.setContentsMargins(16, 14, 16, 14)
         queue_layout.addWidget(QLabel("封面处理列表"))
-        self.item_table = QTableWidget(0, 5)
-        self.item_table.setHorizontalHeaderLabels(["标题", "视频 ID", "封面文件", "检测状态", "检测结论"])
+        self.queue_tabs = QTabWidget()
+        self.queue_tabs.addTab(QWidget(), "采集结果 (0)")
+        self.queue_tabs.addTab(QWidget(), "已下载封面 (0)")
+        self.queue_tabs.currentChanged.connect(self._on_queue_tab_changed)
+        queue_layout.addWidget(self.queue_tabs)
+        selection_bar = QHBoxLayout()
+        for label, callback in (("全选", self._select_all), ("反选", self._invert_selection), ("清除选择", self._clear_selection), ("移除选中", self._remove_selected)):
+            button = QPushButton(label)
+            button.setProperty("secondary", True)
+            button.clicked.connect(callback)
+            selection_bar.addWidget(button)
+            self._selection_buttons.append(button)
+        selection_bar.addWidget(QLabel("前 N 条"))
+        self.select_count_spin = QSpinBox()
+        self.select_count_spin.setRange(1, 10000)
+        self.select_count_spin.setValue(10)
+        selection_bar.addWidget(self.select_count_spin)
+        select_first_button = QPushButton("选择前 N 条")
+        select_first_button.setProperty("secondary", True)
+        select_first_button.clicked.connect(self._select_first_n)
+        selection_bar.addWidget(select_first_button)
+        selection_bar.addWidget(QLabel("按频道"))
+        self.channel_selection_combo = QComboBox()
+        self.channel_selection_combo.addItem("选择频道", "")
+        self.channel_selection_combo.setMinimumWidth(180)
+        selection_bar.addWidget(self.channel_selection_combo, 1)
+        select_channel_button = QPushButton("选择该频道")
+        select_channel_button.setProperty("secondary", True)
+        select_channel_button.clicked.connect(self._select_channel)
+        selection_bar.addWidget(select_channel_button)
+        queue_layout.addLayout(selection_bar)
+        self.selected_count_label = QLabel("已选 0 条")
+        queue_layout.addWidget(self.selected_count_label)
+        self.item_table = QTableWidget(0, 9)
+        self.item_table.setHorizontalHeaderLabels(["选择", "标题", "视频 ID", "频道", "采集状态", "封面状态", "检测状态", "封面文件", "检测结论"])
         self.item_table.verticalHeader().setVisible(False)
         self.item_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.item_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.item_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.item_table.itemSelectionChanged.connect(self._show_selected_review_detail)
-        self.item_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.item_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.item_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.item_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.item_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        self.item_table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
+        self.item_table.itemChanged.connect(self._on_item_changed)
         review_detail = QFrame()
         review_detail.setObjectName("WorkspaceInset")
         review_detail_layout = QVBoxLayout(review_detail)
@@ -1244,7 +1486,14 @@ class CoverPage(QWidget):
         footer = QHBoxLayout()
         self.status_label = QLabel("请从采集结果导入视频。")
         self.status_label.setObjectName("WorkspaceStatus")
-        self.start_button = QPushButton("开始处理封面")
+        self.download_button = QPushButton("下载选中封面")
+        self.download_button.setProperty("secondary", True)
+        self.download_button.clicked.connect(self._request_download)
+        self.review_button = QPushButton("检测选中封面")
+        self.review_button.setProperty("secondary", True)
+        self.review_button.setToolTip("只检测当前勾选且已经下载的封面")
+        self.review_button.clicked.connect(self._request_review)
+        self.start_button = QPushButton("下载封面并检测")
         self.start_button.setProperty("primary", True)
         self.start_button.clicked.connect(self._request_start)
         self.pause_button = QPushButton("暂停")
@@ -1259,6 +1508,8 @@ class CoverPage(QWidget):
         footer.addWidget(self.pause_button)
         footer.addWidget(self.cancel_button)
         footer.addWidget(self.export_button)
+        footer.addWidget(self.download_button)
+        footer.addWidget(self.review_button)
         footer.addWidget(self.start_button)
         root.addLayout(footer)
         self.set_busy(False)
@@ -1266,46 +1517,156 @@ class CoverPage(QWidget):
     def _load_videos(self) -> None:
         self.set_items(self._import_videos())
 
+    @property
+    def items(self) -> list[dict[str, object]]:
+        return [dict(item) for item in self._items]
+
+    def _collect_channel_videos(self) -> None:
+        if not self._channel_urls:
+            self.set_status("请先点击“管理频道清单”填写或导入频道链接。")
+            return
+        self._collect_channels(list(self._channel_urls), self.channel_limit_spin.value())
+
+    def _open_channel_dialog(self) -> None:
+        dialog = ChannelListDialog(self._channel_urls, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._channel_urls = dialog.urls()
+        self.channel_count_label.setText(f"已添加 {len(self._channel_urls)} 个频道")
+        self.set_status(f"频道清单已更新：{len(self._channel_urls)} 个频道，点击“采集频道视频”开始。")
+
     def _request_start(self) -> None:
         if not self._items:
             self.set_status("请先从采集结果导入视频。")
             return
-        if not self.download_check.isChecked() and not self.detect_check.isChecked():
-            self.set_status("至少选择获取封面或检测封面中的一项。")
+        selected = self._selected_items()
+        if not selected:
+            self.set_status("请先勾选要处理的视频，可使用全选、前 N 条或按频道选择。")
             return
-        self._start_cover(list(self._items), self.download_check.isChecked(), self.detect_check.isChecked())
+        self._start_cover(selected, True, True)
+
+    def _request_download(self) -> None:
+        selected = self._selected_items()
+        if not selected:
+            self.set_status("请先勾选要下载封面的视频。")
+            return
+        self.set_status(f"已选择 {len(selected)} 条，准备下载封面。")
+        self._start_cover(selected, True, False)
+
+    def _request_review(self) -> None:
+        selected = self._selected_items()
+        selected = [item for item in selected if str(item.get("cover_path") or "").strip()]
+        if not selected:
+            self.set_status("请先勾选要检测的封面；未下载封面的项目不会进入检测。")
+            return
+        self.set_status(f"已选择 {len(selected)} 条，准备检测选中封面。")
+        self._start_review(selected)
 
     def set_items(self, items: list[dict[str, object]]) -> None:
-        self._items = list(items)
+        self._items = []
+        for raw in items:
+            item = dict(raw)
+            item.setdefault("collection_status", "success")
+            item.setdefault("cover_status", "downloaded" if str(item.get("cover_path") or "") else "pending")
+            item.setdefault("review_status", "completed" if item.get("review") else "pending")
+            self._items.append(item)
         self._review_details.clear()
         self.review_detail_edit.clear()
         self._set_cover_preview(-1)
         self.item_count_label.setText(f"当前 {len(self._items)} 条")
-        self.item_table.setRowCount(len(self._items))
-        for row, item in enumerate(self._items):
+        self._render_queue_table()
+        self._refresh_queue_tabs()
+        self._refresh_channel_combo()
+        self._update_selected_count()
+        if self._items:
+            self.set_status(f"已载入 {len(self._items)} 条视频，可勾选后执行封面操作。")
+
+    def _render_queue_table(self) -> None:
+        self._visible_indices = [
+            index for index, item in enumerate(self._items)
+            if (self._queue_tab_index == 0 and not str(item.get("cover_path") or "").strip())
+            or (self._queue_tab_index == 1 and str(item.get("cover_path") or "").strip())
+        ]
+        self.item_table.blockSignals(True)
+        self.item_table.setRowCount(len(self._visible_indices))
+        for row, source_index in enumerate(self._visible_indices):
+            item = self._items[source_index]
             video = item.get("video") if isinstance(item.get("video"), dict) else item
             video = video if isinstance(video, dict) else {}
             cover_path = str(item.get("cover_path") or "")
             review = item.get("review") if isinstance(item.get("review"), dict) else {}
-            self.item_table.setItem(row, 0, QTableWidgetItem(str(video.get("title") or "")))
-            self.item_table.setItem(row, 1, QTableWidgetItem(str(video.get("video_id") or "")))
-            self.item_table.setItem(row, 2, QTableWidgetItem(cover_path or "待获取"))
-            self.item_table.setItem(row, 3, QTableWidgetItem("等待处理"))
-            self.item_table.setItem(row, 4, QTableWidgetItem(""))
+            checkbox = QTableWidgetItem()
+            checkbox.setFlags(checkbox.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            checkbox.setCheckState(Qt.CheckState.Unchecked)
+            self.item_table.setItem(row, 0, checkbox)
+            self.item_table.setItem(row, 1, QTableWidgetItem(str(video.get("title") or "")))
+            self.item_table.setItem(row, 2, QTableWidgetItem(str(video.get("video_id") or "")))
+            self.item_table.setItem(row, 3, QTableWidgetItem(str(video.get("channel") or "")))
+            self.item_table.setItem(row, 4, self._status_item("collection", item.get("collection_status") or "success"))
+            self.item_table.setItem(row, 5, self._status_item("cover", item.get("cover_status") or "pending"))
+            self.item_table.setItem(row, 6, self._status_item("review", item.get("review_status") or "pending"))
+            self.item_table.setItem(row, 7, QTableWidgetItem(cover_path or "待获取"))
+            self.item_table.setItem(row, 8, QTableWidgetItem(""))
             if review:
                 self.update_job(row, "检测失败" if review.get("error") else "处理完成", cover_path, review)
             elif cover_path:
-                self.item_table.setItem(row, 3, QTableWidgetItem("封面已获取"))
+                self.item_table.setItem(row, 5, self._status_item("cover", "downloaded"))
+        self.item_table.blockSignals(False)
+
+    def _refresh_queue_tabs(self) -> None:
+        downloaded = sum(1 for item in self._items if str(item.get("cover_path") or "").strip())
+        self.queue_tabs.setTabText(0, f"采集结果 ({len(self._items) - downloaded})")
+        self.queue_tabs.setTabText(1, f"已下载封面 ({downloaded})")
+
+    def _on_queue_tab_changed(self, index: int) -> None:
+        self._queue_tab_index = max(0, min(index, 1))
+        self._render_queue_table()
+        self._refresh_channel_combo()
+        self._update_selected_count()
+
+    def append_items(self, items: list[dict[str, object]]) -> None:
+        """Append newly collected rows while preserving the same queue schema."""
+        if not items:
+            return
+        self.set_items(self._items + items)
+
+    def refresh_stage_views(self) -> None:
+        """Refresh tab counts and the filtered table after a worker update."""
+        self._refresh_queue_tabs()
+        if self._queue_tab_index == 1:
+            self._render_queue_table()
+            self._refresh_channel_combo()
+            self._update_selected_count()
+
+    def update_review_by_video_id(self, video_id: str, result: object) -> None:
+        target_id = str(video_id or "")
+        for source_index, item in enumerate(self._items):
+            video = item.get("video") if isinstance(item.get("video"), dict) else item
+            if not isinstance(video, dict) or str(video.get("video_id") or "") != target_id:
+                continue
+            payload = result.to_dict() if hasattr(result, "to_dict") else dict(result) if isinstance(result, dict) else {}
+            item["review"] = payload
+            item["review_status"] = "检测失败" if payload.get("error") else "检测完成"
+            if source_index in self._visible_indices:
+                self.update_job(self._visible_indices.index(source_index), "检测失败" if payload.get("error") else "处理完成", str(item.get("cover_path") or ""), payload)
+            return
 
     def update_job(self, row: int, status: str, cover_path: str = "", result: object = "") -> None:
-        if row < 0 or row >= self.item_table.rowCount():
+        if row < 0 or row >= len(self._visible_indices):
             return
+        source_index = self._visible_indices[row]
         if cover_path:
-            self.item_table.setItem(row, 2, QTableWidgetItem(cover_path))
-        self.item_table.setItem(row, 3, QTableWidgetItem(status))
+            self.item_table.setItem(row, 7, QTableWidgetItem(cover_path))
+            self._items[source_index]["cover_path"] = cover_path
+            self._items[source_index]["cover_status"] = "downloaded"
+        status_column = 6 if "检测" in status or "处理" in status else 5
+        stage = "review" if status_column == 6 else "cover"
+        self.item_table.setItem(row, status_column, self._status_item(stage, status))
+        self._items[source_index]["review_status" if status_column == 6 else "cover_status"] = status
         if isinstance(result, dict):
-            self._review_details[row] = dict(result)
-            detail = self._review_details[row]
+            self._review_details[source_index] = dict(result)
+            self._items[source_index]["review"] = dict(result)
+            detail = self._review_details[source_index]
             if detail.get("error"):
                 display = f"检测失败：{detail.get('error')}"
             else:
@@ -1314,7 +1675,7 @@ class CoverPage(QWidget):
                 display = f"{labels.get(str(detail.get('overall_risk') or ''), '无法判断')}｜{summary}"
             item = QTableWidgetItem(display)
             item.setToolTip(display)
-            self.item_table.setItem(row, 4, item)
+            self.item_table.setItem(row, 8, item)
             if self.item_table.currentRow() == row:
                 self._show_selected_review_detail()
         elif result:
@@ -1323,7 +1684,8 @@ class CoverPage(QWidget):
     def _show_selected_review_detail(self) -> None:
         row = self.item_table.currentRow()
         self._set_cover_preview(row)
-        detail = self._review_details.get(row)
+        source_index = self._visible_indices[row] if 0 <= row < len(self._visible_indices) else -1
+        detail = self._review_details.get(source_index)
         if not detail:
             self.review_detail_edit.setPlainText("该封面尚未完成模型检测。")
             return
@@ -1353,13 +1715,58 @@ class CoverPage(QWidget):
             )
         )
 
+    @staticmethod
+    def _status_item(stage: str, raw_status: object) -> QTableWidgetItem:
+        value = str(raw_status or "pending").strip()
+        labels = {
+            "success": "采集完成",
+            "collection_failed": "采集失败",
+            "pending": "待处理",
+            "downloading": "下载中",
+            "downloaded": "封面已获取",
+            "cover_failed": "下载失败",
+            "reviewing": "检测中",
+            "completed": "检测完成",
+            "review_failed": "检测失败",
+            "获取封面": "下载中",
+            "封面失败": "下载失败",
+            "封面已获取": "封面已获取",
+            "检测封面": "检测中",
+            "处理完成": "检测完成",
+            "检测失败": "检测失败",
+            "处理失败": "处理失败",
+            "采集完成": "采集完成",
+            "待获取": "待处理",
+        }
+        text = labels.get(value, value)
+        item = QTableWidgetItem(text)
+        palette = {
+            "pending": ("#fff4d6", "#8a5a00"),
+            "downloading": ("#e4f0ff", "#175a9e"),
+            "downloaded": ("#e6f7ed", "#176b3a"),
+            "completed": ("#dff5ec", "#176b3a"),
+            "success": ("#e6f7ed", "#176b3a"),
+            "collection_failed": ("#ffe8e6", "#a12622"),
+            "cover_failed": ("#ffe8e6", "#a12622"),
+            "review_failed": ("#ffe8e6", "#a12622"),
+            "采集完成": ("#e6f7ed", "#176b3a"),
+            "检测完成": ("#dff5ec", "#176b3a"),
+            "检测失败": ("#ffe8e6", "#a12622"),
+            "处理失败": ("#ffe8e6", "#a12622"),
+        }
+        background, foreground = palette.get(value, ("#f2f4f7", "#4b5563"))
+        item.setBackground(QColor(background))
+        item.setForeground(QColor(foreground))
+        item.setToolTip(f"{stage}阶段：{text}")
+        return item
+
     def _set_cover_preview(self, row: int) -> None:
         if row < 0 or row >= self.item_table.rowCount():
             self._cover_preview_pixmap = None
             self.cover_preview_label.setPixmap(QPixmap())
             self.cover_preview_label.setText("选择一条封面后显示预览")
             return
-        path_item = self.item_table.item(row, 2)
+        path_item = self.item_table.item(row, 7)
         cover_path = str(path_item.text() or "") if path_item is not None else ""
         pixmap = QPixmap(cover_path) if cover_path and cover_path != "待获取" else QPixmap()
         self._cover_preview_pixmap = pixmap if not pixmap.isNull() else None
@@ -1386,11 +1793,124 @@ class CoverPage(QWidget):
         super().resizeEvent(event)
         self._render_cover_preview()
 
-    def set_busy(self, busy: bool) -> None:
-        for widget in (self.start_button, self.download_check, self.detect_check, self.export_button):
+    def set_busy(self, busy: bool, *, allow_review: bool = False) -> None:
+        for widget in (self.download_button, self.review_button, self.start_button, self.download_check, self.detect_check, self.export_button, self.collect_button, self.manage_channels_button, self.channel_limit_spin):
             widget.setEnabled(not busy)
         self.pause_button.setEnabled(busy)
         self.cancel_button.setEnabled(busy)
+        if allow_review:
+            self.review_button.setEnabled(True)
+
+    def _on_item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() == 0:
+            self._update_selected_count()
+
+    def _selected_rows(self) -> list[int]:
+        return [
+            row for row in range(self.item_table.rowCount())
+            if (item := self.item_table.item(row, 0)) is not None
+            and item.checkState() == Qt.CheckState.Checked
+        ]
+
+    def _selected_items(self) -> list[dict[str, object]]:
+        return [self._items[self._visible_indices[row]] for row in self._selected_rows() if row < len(self._visible_indices)]
+
+    def _set_rows_checked(self, rows: set[int], checked: bool = True) -> None:
+        self.item_table.blockSignals(True)
+        for row in range(self.item_table.rowCount()):
+            item = self.item_table.item(row, 0)
+            if item is not None:
+                item.setCheckState(Qt.CheckState.Checked if (checked and row in rows) else Qt.CheckState.Unchecked)
+        self.item_table.blockSignals(False)
+        self._update_selected_count()
+
+    def _select_all(self) -> None:
+        self._set_rows_checked(set(range(self.item_table.rowCount())))
+        self.set_status(f"已全选当前页 {self.item_table.rowCount()} 条。")
+
+    def _invert_selection(self) -> None:
+        selected = set(self._selected_rows())
+        self.item_table.blockSignals(True)
+        for row in range(self.item_table.rowCount()):
+            item = self.item_table.item(row, 0)
+            if item is not None:
+                item.setCheckState(Qt.CheckState.Unchecked if row in selected else Qt.CheckState.Checked)
+        self.item_table.blockSignals(False)
+        self._update_selected_count()
+        self.set_status(f"已反选当前页，当前勾选 {len(self._selected_rows())} 条。")
+
+    def _clear_selection(self) -> None:
+        self._set_rows_checked(set(), checked=False)
+        self.set_status("已清除当前页选择。")
+
+    def _remove_selected(self) -> None:
+        selected = self._selected_items()
+        if not selected:
+            self.set_status("请先勾选要移除的视频。")
+            return
+        ids = {
+            str((item.get("video") or {}).get("video_id") or "")
+            for item in selected
+            if isinstance(item.get("video"), dict) and str((item.get("video") or {}).get("video_id") or "")
+        }
+        if not ids:
+            self.set_status("选中项目缺少视频 ID，无法移除。")
+            return
+        self._items = [
+            item for item in self._items
+            if str((item.get("video") or {}).get("video_id") or "") not in ids
+        ]
+        self._render_queue_table()
+        self._refresh_queue_tabs()
+        self._refresh_channel_combo()
+        self._update_selected_count()
+        self._remove_items_callback(ids)
+        self.set_status(f"已移除 {len(ids)} 条封面队列记录，磁盘封面文件未删除。")
+
+    def _select_first_n(self) -> None:
+        count = min(self.select_count_spin.value(), self.item_table.rowCount())
+        self._set_rows_checked(set(range(count)))
+        self.set_status(f"已选择当前页前 {count} 条。")
+
+    def _select_channel(self) -> None:
+        channel = str(self.channel_selection_combo.currentData() or "")
+        if not channel:
+            return
+        rows = {
+            row for row, source_index in enumerate(self._visible_indices)
+            for item in [self._items[source_index]]
+            if isinstance(item.get("video"), dict) and str(item["video"].get("channel") or "") == channel
+        }
+        self._set_rows_checked(rows)
+        if rows:
+            first_row = min(rows)
+            self.item_table.setCurrentCell(first_row, 0)
+            target = self.item_table.item(first_row, 0)
+            if target is not None:
+                self.item_table.scrollToItem(target, QAbstractItemView.ScrollHint.PositionAtTop)
+            self.set_status(f"已选择频道“{channel}”的 {len(rows)} 条，并定位到第一条。")
+        else:
+            self.set_status(f"当前页没有频道“{channel}”的视频。")
+
+    def _refresh_channel_combo(self) -> None:
+        current = str(self.channel_selection_combo.currentData() or "")
+        channels = sorted({
+            str((item.get("video") or {}).get("channel") or "").strip()
+            for item in self._items
+            if isinstance(item.get("video"), dict) and str((item.get("video") or {}).get("channel") or "").strip()
+        })
+        self.channel_selection_combo.blockSignals(True)
+        self.channel_selection_combo.clear()
+        self.channel_selection_combo.addItem("选择频道", "")
+        for channel in channels:
+            self.channel_selection_combo.addItem(channel, channel)
+        index = self.channel_selection_combo.findData(current)
+        if index >= 0:
+            self.channel_selection_combo.setCurrentIndex(index)
+        self.channel_selection_combo.blockSignals(False)
+
+    def _update_selected_count(self) -> None:
+        self.selected_count_label.setText(f"已选 {len(self._selected_rows())} 条")
 
     def set_status(self, text: str) -> None:
         self.status_label.setText(text)

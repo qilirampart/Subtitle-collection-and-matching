@@ -246,10 +246,16 @@ QPushButton {
 }
 QPushButton:hover { background: #EFF8F7; border-color: #6CBDB4; }
 QPushButton:pressed { background: #D8EFEB; }
+QPushButton:focus { border-color: #29988D; }
 QPushButton[primary="true"] { background: #0F766E; color: #FFFFFF; border-color: #0F766E; }
 QPushButton[primary="true"]:hover { background: #0A625D; border-color: #0A625D; }
+QPushButton[primary="true"]:pressed { background: #084C48; border-color: #084C48; }
 QPushButton[secondary="true"] { background: #E8F4F2; color: #106B63; border-color: #B8DED8; }
+QPushButton[secondary="true"]:hover { background: #CDEBE6; color: #0A625D; border-color: #29988D; }
+QPushButton[secondary="true"]:pressed { background: #A8D8D0; color: #074C47; border-color: #167B72; }
 QPushButton[danger="true"] { color: #A33B32; background: #FFF7F5; border-color: #F0C6C0; }
+QPushButton[danger="true"]:hover { background: #FDE4DF; border-color: #D8897E; }
+QPushButton[danger="true"]:pressed { background: #F6C9C1; border-color: #B85B50; }
 QProgressBar {
     min-height: 20px;
     border: 1px solid #B9DCD6;

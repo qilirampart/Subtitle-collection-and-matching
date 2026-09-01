@@ -13,6 +13,7 @@ import requests
 
 from app.models import YouTubeVideo
 from app.services.api_config_service import ApiConfigService
+from app.services.youtube_cover_service import YouTubeCoverService
 from app.task_control import TaskControl
 
 
@@ -28,6 +29,7 @@ class CoverReviewResult:
     confidence: float = 0.0
     model_response: str = ""
     error: str = ""
+    thumbnail_url: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -37,6 +39,9 @@ class YouTubeCoverReviewService:
     """Runs a conservative, cover-only visual compliance pre-screen."""
 
     _TIMEOUT_SECONDS = 120
+    # A remote-image request should fail over quickly when the provider cannot
+    # fetch CDN URLs. Local-image analysis keeps the longer timeout above.
+    _URL_TIMEOUT_SECONDS = 20
     _MAX_CONCURRENCY = 3
     _RISK_TAGS = {
         "minor": "未成年人",
@@ -128,15 +133,16 @@ class YouTubeCoverReviewService:
         except (TypeError, ValueError):
             confidence = 0.0
         return CoverReviewResult(
-            video.video_id,
-            video.title,
-            str(cover_path),
-            overall,
-            tuple(tags),
-            str(payload.get("summary") or "").strip(),
-            str(payload.get("evidence") or "").strip(),
-            confidence,
-            str(model_response or "").strip(),
+            video_id=video.video_id,
+            title=video.title,
+            cover_path=str(cover_path),
+            overall_risk=overall,
+            risk_tags=tuple(tags),
+            summary=str(payload.get("summary") or "").strip(),
+            evidence=str(payload.get("evidence") or "").strip(),
+            confidence=confidence,
+            model_response=str(model_response or "").strip(),
+            thumbnail_url=str(video.thumbnail_url or "").strip(),
         )
 
     def review_cover(
@@ -148,10 +154,10 @@ class YouTubeCoverReviewService:
     ) -> CoverReviewResult:
         path = Path(cover_path)
         if not path.is_file():
-            return CoverReviewResult(video.video_id, video.title, str(path), error="封面文件不存在")
+            return CoverReviewResult(video.video_id, video.title, str(path), error="封面文件不存在", thumbnail_url=video.thumbnail_url)
         active_profile = profile if profile is not None else self._active_profile()
         if active_profile is None:
-            return CoverReviewResult(video.video_id, video.title, str(path), error="没有可用的语言模型配置")
+            return CoverReviewResult(video.video_id, video.title, str(path), error="没有可用的语言模型配置", thumbnail_url=video.thumbnail_url)
 
         payload = {
             "model": str(active_profile["model"]),
@@ -191,7 +197,53 @@ class YouTubeCoverReviewService:
                 model_response=raw_content,
             )
         except (OSError, KeyError, IndexError, TypeError, ValueError, requests.RequestException) as exc:
-            return CoverReviewResult(video.video_id, video.title, str(path), error=str(exc))
+            return CoverReviewResult(video.video_id, video.title, str(path), error=str(exc), thumbnail_url=video.thumbnail_url)
+
+    def review_cover_url_first(
+        self,
+        video: YouTubeVideo,
+        cover_path: str | Path = "",
+        *,
+        profile: dict[str, Any] | None = None,
+    ) -> CoverReviewResult:
+        """Try the thumbnail CDN URL first, then fall back to local download."""
+        active_profile = profile if profile is not None else self._active_profile()
+        if active_profile is None:
+            return CoverReviewResult(video.video_id, video.title, str(cover_path or ""), error="没有可用的语言模型配置", thumbnail_url=video.thumbnail_url)
+        url = str(video.thumbnail_url or "").strip()
+        if url:
+            payload = {
+                "model": str(active_profile["model"]),
+                "temperature": float(active_profile.get("temperature") or 0),
+                "messages": [
+                    {"role": "system", "content": self._SYSTEM_PROMPT},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": f"请检测这张视频封面。视频标题仅作参考：{video.title}"},
+                        {"type": "image_url", "image_url": {"url": url}},
+                    ]},
+                ],
+            }
+            try:
+                response = requests.post(
+                    self._endpoint(str(active_profile["api_base"])),
+                    headers={"Authorization": f"Bearer {active_profile['api_key']}", "Content-Type": "application/json"},
+                    json=payload,
+                    timeout=self._URL_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                content = response.json()["choices"][0]["message"]["content"]
+                if isinstance(content, list):
+                    content = "".join(str(item.get("text") or "") for item in content if isinstance(item, dict))
+                return self._normalize_result(video, Path(cover_path or ""), self._parse_response(str(content)), model_response=str(content))
+            except (OSError, KeyError, IndexError, TypeError, ValueError, requests.RequestException):
+                pass
+        path = Path(cover_path) if str(cover_path or "").strip() else Path("")
+        if not path.is_file():
+            downloaded = YouTubeCoverService().download_cover(video)
+            if downloaded.error:
+                return CoverReviewResult(video.video_id, video.title, str(path), error=downloaded.error, thumbnail_url=video.thumbnail_url)
+            path = Path(downloaded.path)
+        return self.review_cover(video, path, profile=active_profile)
 
     def review_batch(
         self,
@@ -200,6 +252,7 @@ class YouTubeCoverReviewService:
         *,
         progress_callback=None,
         task_control: TaskControl | None = None,
+        prefer_url: bool = False,
     ) -> tuple[list[CoverReviewResult], bool]:
         profile = self._active_profile()
         results: list[CoverReviewResult] = []
@@ -210,6 +263,7 @@ class YouTubeCoverReviewService:
                     video.title,
                     str(cover_paths.get(video.video_id) or ""),
                     error="没有可用的语言模型配置",
+                    thumbnail_url=video.thumbnail_url,
                 )
                 results.append(result)
                 if progress_callback is not None:
@@ -223,7 +277,7 @@ class YouTubeCoverReviewService:
             with ThreadPoolExecutor(max_workers=self._MAX_CONCURRENCY) as executor:
                 futures = {
                     executor.submit(
-                        self.review_cover,
+                        self.review_cover_url_first if prefer_url else self.review_cover,
                         video,
                         str(cover_paths.get(video.video_id) or ""),
                         profile=profile,

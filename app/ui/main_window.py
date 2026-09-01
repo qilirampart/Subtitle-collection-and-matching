@@ -291,11 +291,12 @@ class _CoverReviewThread(QThread):
     failed = Signal(str)
     progress = Signal(int, int, object, object)
 
-    def __init__(self, videos: list[YouTubeVideo], cover_paths: dict[str, str], control: TaskControl) -> None:
+    def __init__(self, videos: list[YouTubeVideo], cover_paths: dict[str, str], control: TaskControl, *, prefer_url: bool = False) -> None:
         super().__init__()
         self.videos = videos
         self.cover_paths = cover_paths
         self.control = control
+        self.prefer_url = prefer_url
 
     def run(self) -> None:
         try:
@@ -306,6 +307,7 @@ class _CoverReviewThread(QThread):
                 progress_callback=lambda index, total, video, result: self.progress.emit(
                     index, total, video, result
                 ),
+                prefer_url=self.prefer_url,
             )
             (self.cancelled if was_cancelled else self.succeeded).emit(results)
         except Exception as exc:  # noqa: BLE001
@@ -1426,6 +1428,7 @@ class MainWindow(QMainWindow):
             import_videos=self._import_cover_items,
             collect_channels=self._collect_cover_channels,
             start_review=self._start_cover_page_review,
+            start_url_review=self._start_cover_page_url_review,
             remove_items=self._remove_cover_queue_items,
             start_cover=self._start_standalone_cover,
             pause_cover=self._toggle_pause,
@@ -2364,6 +2367,26 @@ class MainWindow(QMainWindow):
             return
         self._start_parallel_cover_review(videos)
 
+    def _start_cover_page_url_review(self, items: list[dict[str, object]]) -> None:
+        videos: list[YouTubeVideo] = []
+        for item in items:
+            raw = item.get("video") if isinstance(item.get("video"), dict) else item
+            if not isinstance(raw, dict):
+                continue
+            try:
+                video = YouTubeVideo(**raw)
+            except TypeError:
+                continue
+            self._cover_paths[video.video_id] = str(item.get("cover_path") or "")
+            videos.append(video)
+        if not videos:
+            self._cover_page.set_status("没有可进行 URL 优先检测的项目。")
+            return
+        if self._parallel_cover_review_is_running():
+            self._cover_page.set_status("已有封面检测任务正在运行。")
+            return
+        self._start_parallel_cover_review(videos, prefer_url=True)
+
     def _remove_cover_queue_items(self, video_ids: set[str]) -> None:
         ids = {str(video_id or "") for video_id in video_ids if str(video_id or "")}
         if not ids:
@@ -3238,10 +3261,10 @@ class MainWindow(QMainWindow):
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
-    def _start_parallel_cover_review(self, videos: list[YouTubeVideo]) -> None:
+    def _start_parallel_cover_review(self, videos: list[YouTubeVideo], *, prefer_url: bool = False) -> None:
         """Run cover-model calls beside subtitle acquisition without replacing its worker."""
         control = TaskControl()
-        thread = _CoverReviewThread(videos, self._cover_paths, control)
+        thread = _CoverReviewThread(videos, self._cover_paths, control, prefer_url=prefer_url)
         self._parallel_cover_review_control = control
         self._parallel_cover_review_thread = thread
         thread.progress.connect(self._on_parallel_cover_review_progress)
@@ -3250,9 +3273,16 @@ class MainWindow(QMainWindow):
         thread.failed.connect(lambda message: self._on_parallel_cover_review_failed(thread, message))
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(lambda: self._finish_parallel_cover_review_thread(thread))
-        self._set_cover_progress(0, len(videos), "封面检测（与字幕同步）")
+        progress_label = "封面 URL 优先检测" if prefer_url else "封面检测（与字幕同步）"
+        self._set_cover_progress(0, len(videos), progress_label)
         self.cover_review_button.setEnabled(False)
-        self.status_label.setText(f"字幕获取继续进行，已同步启动封面检测：0/{len(videos)}（最多 3 路）。")
+        if prefer_url:
+            message = f"已启动 URL 优先封面检测：0/{len(videos)}（失败自动回退本地下载，最多 3 路）。"
+        else:
+            message = f"字幕获取继续进行，已同步启动封面检测：0/{len(videos)}（最多 3 路）。"
+        self.status_label.setText(message)
+        if hasattr(self, "_cover_page"):
+            self._cover_page.set_status(message)
         thread.start()
 
     def _on_parallel_cover_review_progress(
@@ -3843,11 +3873,20 @@ class MainWindow(QMainWindow):
         if output_path is None:
             return
         source_urls = {video.video_id: video.source_url for video in self._videos}
+        thumbnail_urls = {video.video_id: video.thumbnail_url for video in self._videos}
+        if hasattr(self, "_cover_page"):
+            for item in self._cover_page.items:
+                raw_video = item.get("video") if isinstance(item.get("video"), dict) else {}
+                video_id = str(raw_video.get("video_id") or "")
+                if video_id:
+                    source_urls.setdefault(video_id, str(raw_video.get("source_url") or ""))
+                    thumbnail_urls.setdefault(video_id, str(raw_video.get("thumbnail_url") or ""))
         try:
             exported_count = export_cover_review_results_to_xlsx(
                 output_path,
                 self._cover_review_results,
                 source_urls,
+                thumbnail_urls,
             )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "导出失败", str(exc))

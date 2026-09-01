@@ -1340,6 +1340,7 @@ class CoverPage(QWidget):
         import_videos: Callable[[], list[dict[str, object]]],
         collect_channels: Callable[[list[str], int], None],
         start_review: Callable[[list[dict[str, object]]], None],
+        start_url_review: Callable[[list[dict[str, object]]], None],
         remove_items: Callable[[set[str]], None],
         start_cover: Callable[[list[dict[str, object]], bool, bool], None],
         pause_cover: Callable[[], None],
@@ -1351,6 +1352,7 @@ class CoverPage(QWidget):
         self._import_videos = import_videos
         self._collect_channels = collect_channels
         self._start_review = start_review
+        self._start_url_review = start_url_review
         self._remove_items_callback = remove_items
         self._start_cover = start_cover
         self._export_reviews = export_reviews
@@ -1493,6 +1495,13 @@ class CoverPage(QWidget):
         self.review_button.setProperty("secondary", True)
         self.review_button.setToolTip("只检测当前勾选且已经下载的封面")
         self.review_button.clicked.connect(self._request_review)
+        self.url_review_button = QPushButton("URL优先检测选中封面")
+        self.url_review_button.setProperty("secondary", True)
+        self.url_review_button.setToolTip("先把封面 CDN 地址交给模型，失败后自动下载本地图片再检测")
+        self.url_review_button.clicked.connect(self._request_url_review)
+        # Keep the experimental remote-URL path available in code, but hide it
+        # from the production UI until its latency is acceptable.
+        self.url_review_button.setVisible(False)
         self.start_button = QPushButton("下载封面并检测")
         self.start_button.setProperty("primary", True)
         self.start_button.clicked.connect(self._request_start)
@@ -1510,6 +1519,7 @@ class CoverPage(QWidget):
         footer.addWidget(self.export_button)
         footer.addWidget(self.download_button)
         footer.addWidget(self.review_button)
+        footer.addWidget(self.url_review_button)
         footer.addWidget(self.start_button)
         root.addLayout(footer)
         self.set_busy(False)
@@ -1561,6 +1571,14 @@ class CoverPage(QWidget):
             return
         self.set_status(f"已选择 {len(selected)} 条，准备检测选中封面。")
         self._start_review(selected)
+
+    def _request_url_review(self) -> None:
+        selected = [item for item in self._selected_items() if isinstance(item.get("video"), dict) and str((item.get("video") or {}).get("thumbnail_url") or "").strip()]
+        if not selected:
+            self.set_status("请先勾选带封面 CDN 地址的视频。")
+            return
+        self.set_status(f"已选择 {len(selected)} 条，准备 URL 优先检测（失败自动回退本地下载）。")
+        self._start_url_review(selected)
 
     def set_items(self, items: list[dict[str, object]]) -> None:
         self._items = []
@@ -1794,7 +1812,7 @@ class CoverPage(QWidget):
         self._render_cover_preview()
 
     def set_busy(self, busy: bool, *, allow_review: bool = False) -> None:
-        for widget in (self.download_button, self.review_button, self.start_button, self.download_check, self.detect_check, self.export_button, self.collect_button, self.manage_channels_button, self.channel_limit_spin):
+        for widget in (self.download_button, self.review_button, self.url_review_button, self.start_button, self.download_check, self.detect_check, self.export_button, self.collect_button, self.manage_channels_button, self.channel_limit_spin):
             widget.setEnabled(not busy)
         self.pause_button.setEnabled(busy)
         self.cancel_button.setEnabled(busy)

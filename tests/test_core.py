@@ -262,6 +262,29 @@ class YouTubeCoverReviewServiceTests(unittest.TestCase):
         self.assertIn('"overall_risk":"review"', result.model_response)
         self.assertTrue(post.call_args.kwargs["json"]["messages"][1]["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
 
+    def test_url_first_uses_short_remote_timeout(self) -> None:
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "choices": [{"message": {"content": '{"overall_risk":"safe","risk_tags":[],"confidence":0.9}'}}]
+        }
+        profile = {
+            "id": "llm-1", "enabled": True, "api_base": "https://llm.example",
+            "api_key": "test-key", "model": "vision-model", "temperature": 0,
+        }
+        config = Mock()
+        config.get_llm_profiles.return_value = [profile]
+        config.is_llm_profile_ready.return_value = True
+        video = YouTubeVideo(
+            "url123", "https://www.youtube.com/watch?v=url123", "URL demo",
+            thumbnail_url="https://i.ytimg.com/vi/url123/hqdefault.jpg",
+        )
+        with patch("app.services.youtube_cover_review_service.requests.post", return_value=response) as post:
+            result = YouTubeCoverReviewService(config).review_cover_url_first(video, "")
+
+        self.assertEqual(result.overall_risk, "safe")
+        self.assertEqual(post.call_args.kwargs["timeout"], YouTubeCoverReviewService._URL_TIMEOUT_SECONDS)
+
 
 class SubtitleExcelExportTests(unittest.TestCase):
     def test_exports_one_complete_transcript_per_video(self) -> None:
@@ -340,8 +363,8 @@ class ReviewExcelExportTests(unittest.TestCase):
             )
             sheet = load_workbook(output_path).active
             self.assertEqual(sheet.cell(2, 2).value, "https://youtube.example/watch?v=video-2")
-            self.assertEqual(sheet.cell(2, 7).value, "需要人工复核")
-            self.assertIn('"overall_risk":"review"', sheet.cell(2, 10).value)
+            self.assertEqual(sheet.cell(2, 8).value, "需要人工复核")
+            self.assertIn('"overall_risk":"review"', sheet.cell(2, 11).value)
 
 
 class YouTubeCookieExportTests(unittest.TestCase):

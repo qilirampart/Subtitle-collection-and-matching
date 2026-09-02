@@ -16,9 +16,9 @@ from pathlib import Path
 PRESERVED_DIRECTORIES = ("runtime", "output")
 
 
-def _wait_for_process(pid: int, timeout_seconds: int = 45) -> None:
+def _wait_for_process(pid: int, timeout_seconds: int = 45) -> bool:
     if pid <= 0:
-        return
+        return True
     deadline = time.monotonic() + timeout_seconds
     if sys.platform == "win32":
         while time.monotonic() < deadline:
@@ -29,17 +29,18 @@ def _wait_for_process(pid: int, timeout_seconds: int = 45) -> None:
                 check=False,
             )
             if str(pid) not in completed.stdout:
-                return
+                return True
             time.sleep(0.4)
-        return
+        return False
     while time.monotonic() < deadline:
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
-            return
+            return True
         except PermissionError:
-            return
+            return True
         time.sleep(0.4)
+    return False
 
 
 def _safe_extract(archive_path: Path, staging: Path) -> None:
@@ -68,7 +69,10 @@ def _restore_preserved_data(target: Path, preserved: Path) -> None:
 
 
 def update_windows(archive_path: Path, install_root: Path, executable_name: str, pid: int) -> None:
-    _wait_for_process(pid)
+    if not _wait_for_process(pid):
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, check=False)
+        if not _wait_for_process(pid, timeout_seconds=10):
+            raise RuntimeError("The running application could not be stopped. Please close it and retry.")
     if not archive_path.is_file():
         raise RuntimeError("Downloaded update package is missing.")
     parent = install_root.parent
@@ -84,20 +88,31 @@ def update_windows(archive_path: Path, install_root: Path, executable_name: str,
         _safe_extract(archive_path, staging)
         if not (staging / executable_name).is_file():
             raise RuntimeError("Update package does not contain the application executable.")
-        if install_root.exists():
-            preserved.mkdir(parents=True, exist_ok=False)
-            _move_preserved_data(install_root, preserved)
-            shutil.move(str(install_root), str(backup))
-        shutil.move(str(staging), str(install_root))
-        _restore_preserved_data(install_root, preserved)
+        install_root.mkdir(parents=True, exist_ok=True)
+        backup.mkdir(parents=True, exist_ok=True)
+        # Replace application files entry by entry. runtime/output stay in
+        # place, so an open log or a large cover directory cannot block the
+        # update and user data never needs to be moved.
+        for entry in list(install_root.iterdir()):
+            if entry.name in PRESERVED_DIRECTORIES:
+                continue
+            shutil.move(str(entry), str(backup / entry.name))
+        for entry in list(staging.iterdir()):
+            if entry.name in PRESERVED_DIRECTORIES:
+                continue
+            shutil.move(str(entry), str(install_root / entry.name))
         subprocess.Popen([str(install_root / executable_name)], cwd=str(install_root))
         shutil.rmtree(backup, ignore_errors=True)
     except Exception:
         if backup.exists():
-            shutil.rmtree(install_root, ignore_errors=True)
-            shutil.move(str(backup), str(install_root))
-        if install_root.exists():
-            _restore_preserved_data(install_root, preserved)
+            for entry in list(install_root.iterdir()) if install_root.exists() else []:
+                if entry.name not in PRESERVED_DIRECTORIES:
+                    if entry.is_dir():
+                        shutil.rmtree(entry, ignore_errors=True)
+                    else:
+                        entry.unlink(missing_ok=True)
+            for entry in list(backup.iterdir()):
+                shutil.move(str(entry), str(install_root / entry.name))
         raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -211,4 +226,6 @@ if __name__ == "__main__":
                 ["osascript", "-e", f"display alert \"Update failed\" message {json.dumps(str(exc))}"],
                 check=False,
             )
-        raise
+        # The actionable error has already been shown to the user. Exit with
+        # a failure status without printing a PyInstaller traceback window.
+        raise SystemExit(1)

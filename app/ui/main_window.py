@@ -1673,7 +1673,7 @@ class MainWindow(QMainWindow):
             self._download_page.set_busy(local_busy)
         if hasattr(self, "_cover_page"):
             self._cover_page.set_busy(
-                local_busy or parallel_cover_running,
+                local_busy or parallel_cover_running or self._cover_collect_thread is not None,
                 allow_review=local_busy and self._task_control is not None and self._task_control.paused,
             )
         if hasattr(self, "_subtitle_page"):
@@ -2370,6 +2370,8 @@ class MainWindow(QMainWindow):
         thread.failed.connect(lambda error: self._cover_page.set_status(f"频道采集失败：{error}"))
         thread.finished.connect(lambda: self._finish_cover_collection(thread))
         thread.start()
+        self._cover_page.pause_button.setEnabled(True)
+        self._cover_page.cancel_button.setEnabled(True)
 
     def _finish_cover_collection(self, thread: _CoverCollectThread) -> None:
         if self._cover_collect_thread is thread:
@@ -2414,6 +2416,8 @@ class MainWindow(QMainWindow):
         self._thread.failed.connect(self._on_worker_failed)
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
+        self._cover_page.pause_button.setEnabled(True)
+        self._cover_page.cancel_button.setEnabled(True)
 
     def _start_cover_page_review(self, items: list[dict[str, object]]) -> None:
         videos: list[YouTubeVideo] = []
@@ -3109,6 +3113,9 @@ class MainWindow(QMainWindow):
             self._task_control.resume()
             self.pause_button.setText("暂停")
             self.status_label.setText("任务已继续，将在当前视频处理完成后更新进度。")
+            if self._cover_collect_thread is not None:
+                self._cover_page.pause_button.setText("暂停")
+                self._cover_page.set_status("采集任务已继续。")
             if isinstance(self._thread, _StandaloneDownloadThread):
                 self._download_page.pause_button.setText("暂停")
                 self._download_page.set_status("下载任务已继续。")
@@ -3119,6 +3126,9 @@ class MainWindow(QMainWindow):
             self._task_control.pause()
             self.pause_button.setText("继续")
             self.status_label.setText("将在当前视频处理完成后暂停。")
+            if self._cover_collect_thread is not None:
+                self._cover_page.pause_button.setText("继续")
+                self._cover_page.set_status("将在当前频道采集完成后暂停。")
             if isinstance(self._thread, _StandaloneDownloadThread):
                 self._download_page.pause_button.setText("继续")
                 self._download_page.set_status("将在当前下载检查点暂停。")

@@ -253,6 +253,7 @@ class YouTubeCoverReviewService:
         progress_callback=None,
         task_control: TaskControl | None = None,
         prefer_url: bool = False,
+        concurrency: int | None = None,
     ) -> tuple[list[CoverReviewResult], bool]:
         profile = self._active_profile()
         results: list[CoverReviewResult] = []
@@ -269,12 +270,13 @@ class YouTubeCoverReviewService:
                 if progress_callback is not None:
                     progress_callback(index, len(videos), video, result)
             return results, False
-        for batch_start in range(0, len(videos), self._MAX_CONCURRENCY):
+        workers = max(1, min(int(concurrency or self._MAX_CONCURRENCY), 6))
+        for batch_start in range(0, len(videos), workers):
             if task_control is not None and not task_control.checkpoint():
                 return results, True
-            batch = videos[batch_start : batch_start + self._MAX_CONCURRENCY]
+            batch = videos[batch_start : batch_start + workers]
             batch_results: dict[str, CoverReviewResult] = {}
-            with ThreadPoolExecutor(max_workers=self._MAX_CONCURRENCY) as executor:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = {
                     executor.submit(
                         self.review_cover_url_first if prefer_url else self.review_cover,

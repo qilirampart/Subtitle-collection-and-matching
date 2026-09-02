@@ -287,6 +287,11 @@ class YouTubeCoverReviewService:
                     for video in batch
                 }
                 for future in as_completed(futures):
+                    if task_control is not None and not task_control.checkpoint():
+                        for pending_future in futures:
+                            if not pending_future.done():
+                                pending_future.cancel()
+                        return results, True
                     video = futures[future]
                     result = future.result()
                     batch_results[video.video_id] = result

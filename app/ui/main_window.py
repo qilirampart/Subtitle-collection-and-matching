@@ -873,9 +873,12 @@ class _StandaloneCoverThread(QThread):
                             videos.append((item, None))
                     else:
                         videos.append((item, None))
-                with ThreadPoolExecutor(max_workers=max(1, min(self.download_concurrency, 6))) as executor:
-                    futures = {executor.submit(cover_service.download_cover, video): (index, item, video) for index, (item, video) in enumerate(videos) if video is not None}
+                executor = ThreadPoolExecutor(max_workers=max(1, min(self.download_concurrency, 6)))
+                futures = {executor.submit(cover_service.download_cover, video): (index, item, video) for index, (item, video) in enumerate(videos) if video is not None}
+                try:
                     for future in as_completed(futures):
+                        if not self.control.checkpoint():
+                            break
                         index, item, video = futures[future]
                         downloaded = future.result()
                         if downloaded.error:
@@ -884,7 +887,12 @@ class _StandaloneCoverThread(QThread):
                         else:
                             self.item_updated.emit(index, "处理完成", downloaded.path, "")
                             results.append({"video": video.to_dict(), "cover_path": downloaded.path})
-                self.completed.emit(results, False)
+                finally:
+                    for future in futures:
+                        if not future.done():
+                            future.cancel()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                self.completed.emit(results, self.control.cancelled)
                 return
             for index, item in enumerate(self.items):
                 if not self.control.checkpoint():
@@ -983,6 +991,8 @@ class MainWindow(QMainWindow):
         self._state_persist_timer.setSingleShot(True)
         self._state_persist_timer.timeout.connect(self._persist_workspace_state)
         self._workspace_refresh_timer = QTimer(self)
+        self._ui_refresh_pending = False
+        self._cover_page_refresh_pending = False
         self._build_ui()
         self._apply_matching_service_config(self._api_config_service.get_matching_service_config())
         self._workspace_refresh_timer.timeout.connect(self._refresh_workspace_pages)
@@ -2031,6 +2041,25 @@ class MainWindow(QMainWindow):
         if snapshot.get("active") and not self._state_persist_timer.isActive():
             self._state_persist_timer.start(1200)
 
+    def _schedule_workspace_refresh(self) -> None:
+        if self._ui_refresh_pending:
+            return
+        self._ui_refresh_pending = True
+        def refresh() -> None:
+            self._ui_refresh_pending = False
+            self._refresh_workspace_pages()
+        QTimer.singleShot(300, refresh)
+
+    def _schedule_cover_page_refresh(self) -> None:
+        if self._cover_page_refresh_pending:
+            return
+        self._cover_page_refresh_pending = True
+        def refresh() -> None:
+            self._cover_page_refresh_pending = False
+            if hasattr(self, "_cover_page"):
+                self._cover_page.refresh_stage_views()
+        QTimer.singleShot(300, refresh)
+
     def _persist_workspace_state(self) -> None:
         if not hasattr(self, "_dashboard_page"):
             return
@@ -2480,7 +2509,7 @@ class MainWindow(QMainWindow):
 
     def _on_standalone_cover_item(self, row: int, status: str, cover_path: str, result: object) -> None:
         self._cover_page.update_job(row, status, cover_path, result)
-        self._cover_page.refresh_stage_views()
+        self._schedule_cover_page_refresh()
         # Persist each completed item (debounced) so a restart never falls
         # back to an old 2971/463-style snapshot.
         if not self._state_persist_timer.isActive():
@@ -2492,7 +2521,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(message)
         self._cover_page.set_status(message)
         self._set_cover_progress(finished, total, f"封面处理 · 当前第 {row + 1} 条")
-        self._refresh_workspace_pages()
+        self._schedule_workspace_refresh()
 
     def _on_standalone_cover_completed(self, results: list[dict[str, object]], cancelled: bool) -> None:
         for result in results:
@@ -2581,7 +2610,7 @@ class MainWindow(QMainWindow):
         message = f"字幕转写：{finished}/{total}，当前第 {row + 1} 条 {status}"
         self.status_label.setText(message)
         self._subtitle_page.set_status(message)
-        self._refresh_workspace_pages()
+        self._schedule_workspace_refresh()
 
     def _on_standalone_subtitle_completed(
         self,
@@ -3116,6 +3145,9 @@ class MainWindow(QMainWindow):
             if self._cover_collect_thread is not None:
                 self._cover_page.pause_button.setText("暂停")
                 self._cover_page.set_status("采集任务已继续。")
+            if self._thread is not None and isinstance(self._thread, _StandaloneCoverThread):
+                self._cover_page.pause_button.setText("暂停")
+                self._cover_page.set_status("封面下载任务已继续。")
             if isinstance(self._thread, _StandaloneDownloadThread):
                 self._download_page.pause_button.setText("暂停")
                 self._download_page.set_status("下载任务已继续。")
@@ -3129,6 +3161,9 @@ class MainWindow(QMainWindow):
             if self._cover_collect_thread is not None:
                 self._cover_page.pause_button.setText("继续")
                 self._cover_page.set_status("将在当前频道采集完成后暂停。")
+            if self._thread is not None and isinstance(self._thread, _StandaloneCoverThread):
+                self._cover_page.pause_button.setText("继续")
+                self._cover_page.set_status("将在当前下载请求结束后暂停。")
             if isinstance(self._thread, _StandaloneDownloadThread):
                 self._download_page.pause_button.setText("继续")
                 self._download_page.set_status("将在当前下载检查点暂停。")
@@ -3166,9 +3201,14 @@ class MainWindow(QMainWindow):
             self._browser_capture_dialog.reject()
         self.pause_button.setEnabled(False)
         self.cancel_task_button.setEnabled(False)
+        if isinstance(self._thread, _StandaloneCoverThread):
+            self._cover_page.pause_button.setEnabled(False)
+            self._cover_page.cancel_button.setEnabled(False)
         self.status_label.setText("正在取消任务，当前视频完成后将停止。")
         if isinstance(self._thread, _StandaloneDownloadThread):
             self._download_page.set_status("正在取消下载任务，当前请求结束后停止。")
+        if isinstance(self._thread, _StandaloneCoverThread):
+            self._cover_page.set_status("正在取消封面下载，当前请求结束后停止。")
         if isinstance(self._thread, _StandaloneSubtitleThread):
             self._subtitle_page.set_status("正在取消字幕任务，当前素材处理结束后停止。")
 
@@ -3213,7 +3253,7 @@ class MainWindow(QMainWindow):
         )
         self.status_label.setText(f"视频下载：{completed}/{total}，当前第 {row + 1} 条 {status}")
         self._download_page.set_status(f"视频下载：{completed}/{total}，当前第 {row + 1} 条 {status}")
-        self._refresh_workspace_pages()
+        self._schedule_workspace_refresh()
 
     def _on_standalone_download_completed(self, results: list[dict[str, object]], cancelled: bool) -> None:
         self._standalone_download_results = results

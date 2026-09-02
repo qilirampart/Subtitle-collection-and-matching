@@ -88,6 +88,7 @@ class YouTubeCollector:
         if max(0, int(max_items or 0)):
             options["playlistend"] = max(0, int(max_items or 0))
         payload = self._extract(options, normalized_url, download=False)
+        channel_id = str(payload.get("channel_id") or payload.get("uploader_id") or "").strip()
         seen_ids: set[str] = set()
         videos: list[YouTubeVideo] = []
         for entry in payload.get("entries") or []:
@@ -109,6 +110,7 @@ class YouTubeCollector:
                     # thumbnail.  The standard URL is a reliable fallback.
                     thumbnail_url=str(entry.get("thumbnail") or "").strip()
                     or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                    channel_id=str(entry.get("channel_id") or channel_id).strip(),
                 )
             )
         return videos

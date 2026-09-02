@@ -115,7 +115,7 @@ class LlmConfigDialog(QDialog):
         content.setSpacing(10)
         hint = QLabel(
             "语言模型配置供文本纠偏、翻译、视频分析等功能复用。当前支持 OpenAI 兼容接口；"
-            "一个模型配置可被多个功能绑定。API Key 仅保存在本机。"
+            "一个模型配置可被多个功能绑定。列表从上到下为调用优先级，API Key 仅保存在本机。"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #586174;")
@@ -123,8 +123,8 @@ class LlmConfigDialog(QDialog):
 
         table_group = QGroupBox("模型配置列表")
         table_layout = QVBoxLayout(table_group)
-        self.profile_table = QTableWidget(0, 4)
-        self.profile_table.setHorizontalHeaderLabels(["启用", "名称", "模型", "状态"])
+        self.profile_table = QTableWidget(0, 5)
+        self.profile_table.setHorizontalHeaderLabels(["优先级", "启用", "名称", "模型", "状态"])
         self.profile_table.verticalHeader().setVisible(False)
         self.profile_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.profile_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -133,18 +133,25 @@ class LlmConfigDialog(QDialog):
         self.profile_table.setMinimumHeight(170)
         header = self.profile_table.horizontalHeader()
         header.setStretchLastSection(True)
-        header.resizeSection(0, 58)
-        header.resizeSection(1, 220)
-        header.resizeSection(2, 210)
+        header.resizeSection(0, 76)
+        header.resizeSection(1, 58)
+        header.resizeSection(2, 220)
+        header.resizeSection(3, 210)
         self.profile_table.itemSelectionChanged.connect(self._on_profile_selected)
         table_layout.addWidget(self.profile_table)
         actions = QHBoxLayout()
         add_button = QPushButton("新增模型")
         self.remove_button = QPushButton("删除当前")
+        self.move_up_button = QPushButton("上移优先级")
+        self.move_down_button = QPushButton("下移优先级")
         add_button.clicked.connect(self._add_profile)
         self.remove_button.clicked.connect(self._remove_profile)
+        self.move_up_button.clicked.connect(lambda: self._move_profile(-1))
+        self.move_down_button.clicked.connect(lambda: self._move_profile(1))
         actions.addWidget(add_button)
         actions.addWidget(self.remove_button)
+        actions.addWidget(self.move_up_button)
+        actions.addWidget(self.move_down_button)
         actions.addStretch(1)
         table_layout.addLayout(actions)
         content.addWidget(table_group)
@@ -216,6 +223,7 @@ class LlmConfigDialog(QDialog):
         for index, profile in enumerate(self._profiles):
             ready = self._service.is_llm_profile_ready(profile)
             values = (
+                "1（最高）" if index == 0 else str(index + 1),
                 "是" if profile.get("enabled", True) else "否",
                 str(profile.get("name") or "未命名模型"),
                 str(profile.get("model") or "未填写"),
@@ -223,7 +231,7 @@ class LlmConfigDialog(QDialog):
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter if column == 0 else Qt.AlignmentFlag.AlignVCenter)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter if column < 2 else Qt.AlignmentFlag.AlignVCenter)
                 self.profile_table.setItem(index, column, item)
         self.profile_table.blockSignals(False)
         if 0 <= selected_index < len(self._profiles):
@@ -234,6 +242,8 @@ class LlmConfigDialog(QDialog):
             self._set_form_enabled(False)
         self.remove_button.setEnabled(bool(self._profiles))
         self.test_button.setEnabled(0 <= self._current_index < len(self._profiles))
+        self.move_up_button.setEnabled(self._current_index > 0)
+        self.move_down_button.setEnabled(0 <= self._current_index < len(self._profiles) - 1)
 
     def _on_profile_selected(self) -> None:
         row = self.profile_table.currentRow()
@@ -241,6 +251,8 @@ class LlmConfigDialog(QDialog):
             return
         self._apply_current_form()
         self._load_profile(row)
+        self.move_up_button.setEnabled(row > 0)
+        self.move_down_button.setEnabled(row < len(self._profiles) - 1)
 
     def _load_profile(self, index: int) -> None:
         self._current_index = index
@@ -343,6 +355,18 @@ class LlmConfigDialog(QDialog):
         self._profiles.pop(self._current_index)
         self._refresh_table(min(self._current_index, len(self._profiles) - 1))
 
+    def _move_profile(self, offset: int) -> None:
+        if not (0 <= self._current_index < len(self._profiles)):
+            return
+        self._apply_current_form()
+        target = self._current_index + offset
+        if target < 0 or target >= len(self._profiles):
+            return
+        self._profiles[self._current_index], self._profiles[target] = (
+            self._profiles[target], self._profiles[self._current_index]
+        )
+        self._refresh_table(target)
+
     def _save(self) -> None:
         self._apply_current_form()
         try:
@@ -350,5 +374,5 @@ class LlmConfigDialog(QDialog):
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "保存失败", str(exc))
             return
-        QMessageBox.information(self, "已保存", "语言模型配置已保存，可在 ASR 配置中选择用于文本纠偏。")
+        QMessageBox.information(self, "已保存", "语言模型配置及调用优先级已保存。")
         self.close()

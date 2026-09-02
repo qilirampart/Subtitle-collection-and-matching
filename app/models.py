@@ -12,6 +12,7 @@ class YouTubeVideo:
     upload_date: str = ""
     duration_seconds: int = 0
     thumbnail_url: str = ""
+    channel_id: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)

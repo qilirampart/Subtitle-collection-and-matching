@@ -80,13 +80,15 @@ def export_cover_review_results_to_xlsx(
     reviews: Iterable[object],
     source_urls: dict[str, str],
     thumbnail_urls: dict[str, str] | None = None,
+    channel_ids: dict[str, str] | None = None,
+    channel_names: dict[str, str] | None = None,
 ) -> int:
     """Export complete cover-review responses, including the original model reply."""
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "封面检测结果"
     headers = (
-        "视频标题", "原视频链接", "视频 ID", "封面 CDN 地址", "封面文件", "检测结论", "风险标签", "摘要",
+        "频道 ID", "频道名", "视频标题", "原视频链接", "视频 ID", "封面 CDN 地址", "封面文件", "检测结论", "风险标签", "摘要",
         "可见证据", "置信度", "模型原始回复", "错误信息",
     )
     exported = _write_sheet(
@@ -94,8 +96,9 @@ def export_cover_review_results_to_xlsx(
         headers,
         (
             (
-                getattr(review, "title", ""), source_urls.get(str(getattr(review, "video_id", "")), ""),
-                getattr(review, "video_id", ""),
+                (channel_ids or {}).get(str(getattr(review, "video_id", "")), ""),
+                (channel_names or {}).get(str(getattr(review, "video_id", "")), ""), getattr(review, "title", ""),
+                source_urls.get(str(getattr(review, "video_id", "")), ""), getattr(review, "video_id", ""),
                 getattr(review, "thumbnail_url", "") or (thumbnail_urls or {}).get(str(getattr(review, "video_id", "")), ""),
                 getattr(review, "cover_path", ""),
                 getattr(review, "overall_risk", ""), "、".join(getattr(review, "risk_tags", ()) or ()),
@@ -105,7 +108,7 @@ def export_cover_review_results_to_xlsx(
             )
             for review in reviews
         ),
-        (38, 60, 18, 70, 55, 16, 24, 42, 60, 12, 100, 42),
+        (28, 26, 38, 60, 18, 70, 55, 16, 24, 42, 60, 12, 100),
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(output_path)

@@ -362,9 +362,9 @@ class ReviewExcelExportTests(unittest.TestCase):
                 1,
             )
             sheet = load_workbook(output_path).active
-            self.assertEqual(sheet.cell(2, 2).value, "https://youtube.example/watch?v=video-2")
-            self.assertEqual(sheet.cell(2, 8).value, "需要人工复核")
-            self.assertIn('"overall_risk":"review"', sheet.cell(2, 11).value)
+            self.assertEqual(sheet.cell(2, 4).value, "https://youtube.example/watch?v=video-2")
+            self.assertEqual(sheet.cell(2, 10).value, "需要人工复核")
+            self.assertIn('"overall_risk":"review"', sheet.cell(2, 13).value)
 
 
 class YouTubeCookieExportTests(unittest.TestCase):

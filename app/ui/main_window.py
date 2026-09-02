@@ -4028,6 +4028,8 @@ class MainWindow(QMainWindow):
             return
         source_urls = {video.video_id: video.source_url for video in self._videos}
         thumbnail_urls = {video.video_id: video.thumbnail_url for video in self._videos}
+        channel_ids = {video.video_id: str(getattr(video, "channel_id", "") or "") for video in self._videos}
+        channel_names = {video.video_id: str(video.channel or "") for video in self._videos}
         if hasattr(self, "_cover_page"):
             for item in self._cover_page.items:
                 raw_video = item.get("video") if isinstance(item.get("video"), dict) else {}
@@ -4035,12 +4037,16 @@ class MainWindow(QMainWindow):
                 if video_id:
                     source_urls.setdefault(video_id, str(raw_video.get("source_url") or ""))
                     thumbnail_urls.setdefault(video_id, str(raw_video.get("thumbnail_url") or ""))
+                    channel_ids.setdefault(video_id, str(raw_video.get("channel_id") or ""))
+                    channel_names.setdefault(video_id, str(raw_video.get("channel") or ""))
         try:
             exported_count = export_cover_review_results_to_xlsx(
                 output_path,
                 self._cover_review_results,
                 source_urls,
                 thumbnail_urls,
+                channel_ids,
+                channel_names,
             )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "导出失败", str(exc))

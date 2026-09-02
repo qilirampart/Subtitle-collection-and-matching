@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 import os
 import shutil
 import subprocess
@@ -194,10 +194,11 @@ class _CoverCollectThread(QThread):
     succeeded = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, urls: list[str], limit: int) -> None:
+    def __init__(self, urls: list[str], limit: int, control: TaskControl | None = None) -> None:
         super().__init__()
         self.urls = urls
         self.limit = limit
+        self.control = control
 
     def run(self) -> None:
         collected: list[dict[str, object]] = []
@@ -205,6 +206,8 @@ class _CoverCollectThread(QThread):
         collector = VerificationWorkflow().collector
         total = len(self.urls)
         for index, url in enumerate(self.urls, start=1):
+            if self.control is not None and not self.control.checkpoint():
+                break
             try:
                 videos = collector.collect_channel(url, max_items=self.limit)
                 added = 0
@@ -2354,7 +2357,8 @@ class MainWindow(QMainWindow):
             return
         self._cover_page.set_busy(True)
         self._cover_page.set_status(f"正在采集频道：0/{len(urls)}...")
-        thread = _CoverCollectThread(urls, limit)
+        self._task_control = TaskControl()
+        thread = _CoverCollectThread(urls, limit, self._task_control)
         self._cover_collect_thread = thread
         thread.progress.connect(
             lambda index, total, url, added, error: self._cover_page.set_status(
@@ -2370,6 +2374,7 @@ class MainWindow(QMainWindow):
     def _finish_cover_collection(self, thread: _CoverCollectThread) -> None:
         if self._cover_collect_thread is thread:
             self._cover_collect_thread = None
+        self._task_control = None
         self._cover_page.set_busy(False)
 
     def _on_cover_channels_collected(self, items: list[dict[str, object]]) -> None:

@@ -33,11 +33,13 @@ from app.services.youtube_asr import YouTubeAsrService
 from app.services.subtitle_excel_exporter import export_subtitles_to_xlsx
 from app.services.review_excel_exporter import export_cover_review_results_to_xlsx, export_matching_results_to_xlsx
 from app.services.proxy_discovery_service import ProxyDiscoveryService
-from app.services.task_state import TaskStateStore, has_recoverable_work
+from app.services.resource_governor import ResourceGovernor
+from app.services.task_state import TaskStateStore, has_recoverable_work, normalize_task_state
 from app.services.update_service import ApplicationUpdateService, UpdateError, is_newer_version, version_key
 from app.services.youtube_audio_service import YouTubeAudioService
 from app.task_control import TaskControl
-from app.ui.workspace_pages import MatchingPage, _channel_urls_from_file
+from app.ui.main_window import MainWindow
+from app.ui.workspace_pages import MatchingPage, _channel_urls_from_file, load_cover_items_from_workbook
 from app.workflow import VerificationWorkflow
 from updater.app_updater import update_windows
 
@@ -179,6 +181,34 @@ class MatchingSelectionTests(unittest.TestCase):
         self.assertTrue(all(item["source_video_id"] == "channel-a-1" for item in selected))
 
 
+class CoverWorkbookImportTests(unittest.TestCase):
+    def test_imports_common_cover_columns_and_deduplicates_video_ids(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "covers.xlsx"
+            workbook = __import__("openpyxl").Workbook()
+            sheet = workbook.active
+            sheet.append(["代理商简称", "频道 ID", "频道名", "视频标题", "原视频链接", "视频 ID", "封面 CDN 地址"])
+            sheet.append(["A", "UC1", "Channel", "Title", "https://youtu.be/v1", "v1", "https://img/v1.jpg"])
+            sheet.append(["A", "UC1", "Channel", "Duplicate", "", "v1", ""])
+            workbook.save(path)
+            workbook.close()
+            items = load_cover_items_from_workbook(path)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["video"]["video_id"], "v1")
+        self.assertEqual(items[0]["video"]["channel_id"], "UC1")
+        self.assertEqual(items[0]["video"]["thumbnail_url"], "https://img/v1.jpg")
+
+    def test_import_requires_video_id_column(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid.xlsx"
+            workbook = __import__("openpyxl").Workbook()
+            workbook.active.append(["标题"])
+            workbook.save(path)
+            workbook.close()
+            with self.assertRaisesRegex(ValueError, "视频 ID"):
+                load_cover_items_from_workbook(path)
+
+
 class YouTubeCoverServiceTests(unittest.TestCase):
     def test_downloads_thumbnail_to_simple_video_id_filename(self) -> None:
         response = Mock()
@@ -227,6 +257,15 @@ class YouTubeCoverServiceTests(unittest.TestCase):
 
 
 class YouTubeCoverReviewServiceTests(unittest.TestCase):
+    def test_prompt_intensity_changes_only_policy_suffix(self) -> None:
+        service = YouTubeCoverReviewService()
+        conservative = service.build_system_prompt("conservative")
+        strict = service.build_system_prompt("strict")
+        self.assertIn('"overall_risk": "safe|review|risk|unknown"', conservative)
+        self.assertIn("检测强度：保守", conservative)
+        self.assertIn("检测强度：严格", strict)
+        self.assertNotEqual(conservative, strict)
+
     def test_parses_structured_multimodal_result(self) -> None:
         response = Mock()
         response.raise_for_status.return_value = None
@@ -1125,6 +1164,75 @@ class TaskControlTests(unittest.TestCase):
 
 
 class TaskStateStoreTests(unittest.TestCase):
+    def test_migrates_legacy_snapshot_to_independent_lanes(self) -> None:
+        legacy = {
+            "version": 1,
+            "active": True,
+            "task_kind": "字幕获取 + 匹配核验",
+            "status": "正在获取字幕",
+            "task_spec": {"kind": "prepare"},
+            "videos": [{"video_id": "video-1"}],
+            "cover_queue_items": [{"video": {"video_id": "cover-1"}}],
+        }
+
+        migrated = normalize_task_state(legacy)
+
+        self.assertEqual(migrated["version"], 2)
+        self.assertTrue(migrated["lanes"]["subtitle_lane"]["active"])
+        self.assertTrue(migrated["lanes"]["matching_lane"]["active"])
+        self.assertFalse(migrated["lanes"]["cover_lane"]["active"])
+        self.assertEqual(migrated["lanes"]["subtitle_lane"]["stage"], "prepare")
+        self.assertEqual(migrated["videos"], legacy["videos"])
+
+    def test_normalizes_v2_snapshot_without_losing_existing_lane_details(self) -> None:
+        payload = {
+            "version": 2,
+            "active": True,
+            "lanes": {
+                "cover_lane": {"active": True, "stage": "download", "status": "下载中", "progress": {"completed": 3}},
+            },
+        }
+
+        normalized = normalize_task_state(payload)
+
+        self.assertEqual(normalized["lanes"]["cover_lane"]["progress"]["completed"], 3)
+        self.assertEqual(normalized["lanes"]["cover_lane"]["stage"], "download")
+        self.assertIn("subtitle_lane", normalized["lanes"])
+        self.assertIn("matching_lane", normalized["lanes"])
+
+    def test_active_v2_lane_is_recoverable_when_legacy_flag_is_false(self) -> None:
+        payload = {
+            "version": 2,
+            "active": False,
+            "lanes": {"cover_lane": {"active": True, "stage": "download"}},
+        }
+
+        self.assertTrue(has_recoverable_work(payload))
+
+    def test_preserves_independent_active_lane_states_across_store_round_trip(self) -> None:
+        payload = {
+            "active": True,
+            "task_kind": "封面处理 + 字幕获取 + 匹配核验",
+            "lanes": {
+                "cover_lane": {"active": True, "stage": "download", "status": "封面下载中"},
+                "subtitle_lane": {"active": True, "stage": "asr_fallback", "status": "ASR 中", "progress": {"completed": 4}},
+                "matching_lane": {"active": True, "stage": "matching", "status": "服务端轮询中"},
+            },
+        }
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "runtime" / "session_state.json"
+            with patch("app.services.task_state.TASK_STATE_PATH", state_path):
+                store = TaskStateStore()
+                store.save(payload)
+                loaded = store.load()
+
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertTrue(has_recoverable_work(loaded))
+        self.assertEqual(loaded["lanes"]["cover_lane"]["stage"], "download")
+        self.assertEqual(loaded["lanes"]["subtitle_lane"]["progress"]["completed"], 4)
+        self.assertEqual(loaded["lanes"]["matching_lane"]["status"], "服务端轮询中")
+
     def test_round_trips_atomic_snapshot(self) -> None:
         with TemporaryDirectory() as directory:
             state_path = Path(directory) / "runtime" / "session_state.json"
@@ -1135,6 +1243,8 @@ class TaskStateStoreTests(unittest.TestCase):
 
         self.assertIsNotNone(loaded)
         self.assertTrue(loaded["active"])
+        self.assertEqual(loaded["version"], 2)
+        self.assertIn("lanes", loaded)
         self.assertEqual(loaded["items"][0]["video_id"], "video-1")
         self.assertTrue(loaded["updated_at"])
 
@@ -1160,6 +1270,39 @@ class TaskStateStoreTests(unittest.TestCase):
         }
 
         self.assertFalse(has_recoverable_work(payload))
+
+
+class CoverLaneStateTests(unittest.TestCase):
+    def test_cover_lane_is_independent_from_subtitle_worker_state(self) -> None:
+        class Probe:
+            _cover_thread_is_running = MainWindow._cover_thread_is_running
+            _cover_collection_is_running = MainWindow._cover_collection_is_running
+            _cover_lane_is_running = MainWindow._cover_lane_is_running
+
+            @staticmethod
+            def _parallel_cover_review_is_running() -> bool:
+                return False
+
+        probe = Probe()
+        probe._cover_thread = SimpleNamespace(isRunning=lambda: True)
+        probe._cover_collect_thread = None
+
+        self.assertTrue(probe._cover_lane_is_running())
+        probe._cover_thread = SimpleNamespace(isRunning=lambda: False)
+        probe._cover_collect_thread = SimpleNamespace(isRunning=lambda: True)
+        self.assertTrue(probe._cover_lane_is_running())
+
+
+class ResourceGovernorTests(unittest.TestCase):
+    def test_stable_mode_is_bounded_and_slows_cover_during_asr(self) -> None:
+        governor = ResourceGovernor("stable")
+
+        self.assertEqual(governor.clamp("cover_download", 4), 2)
+        self.assertEqual(governor.clamp("cover_download", 4, asr_active=True), 1)
+        self.assertEqual(governor.clamp("asr", 3), 1)
+
+    def test_unknown_mode_falls_back_to_stable(self) -> None:
+        self.assertEqual(ResourceGovernor("turbo").limits().cover_review, 1)
 
 
 if __name__ == "__main__":

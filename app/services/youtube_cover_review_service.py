@@ -71,6 +71,18 @@ class YouTubeCoverReviewService:
         "明确出现风险内容才使用 risk；overall_risk 为 safe 时 risk_tags 必须为空数组；"
         "confidence 必须是 0 到 1 之间的小数。"
     )
+    _INTENSITY_GUIDANCE = {
+        "conservative": "检测强度：保守。只有明确可见且证据充分时判定 risk，疑似情况判定 review。",
+        "standard": "检测强度：标准。在保证证据可见的前提下，平衡风险召回率和误报率。",
+        "strict": "检测强度：严格。对疑似风险更敏感，更多情况进入 review；仍不得仅凭模糊内容直接判定 risk。",
+    }
+
+    @classmethod
+    def build_system_prompt(cls, intensity: str = "standard") -> str:
+        key = str(intensity or "standard").strip().lower()
+        if key not in cls._INTENSITY_GUIDANCE:
+            key = "standard"
+        return f"{cls._SYSTEM_PROMPT}\n\n{cls._INTENSITY_GUIDANCE[key]}"
 
     def __init__(self, config_service: ApiConfigService | None = None) -> None:
         self.config_service = config_service or ApiConfigService()
@@ -151,6 +163,7 @@ class YouTubeCoverReviewService:
         cover_path: str | Path,
         *,
         profile: dict[str, Any] | None = None,
+        intensity: str = "standard",
     ) -> CoverReviewResult:
         path = Path(cover_path)
         if not path.is_file():
@@ -163,7 +176,7 @@ class YouTubeCoverReviewService:
             "model": str(active_profile["model"]),
             "temperature": float(active_profile.get("temperature") or 0),
             "messages": [
-                {"role": "system", "content": self._SYSTEM_PROMPT},
+                {"role": "system", "content": self.build_system_prompt(intensity)},
                 {
                     "role": "user",
                     "content": [
@@ -205,6 +218,7 @@ class YouTubeCoverReviewService:
         cover_path: str | Path = "",
         *,
         profile: dict[str, Any] | None = None,
+        intensity: str = "standard",
     ) -> CoverReviewResult:
         """Try the thumbnail CDN URL first, then fall back to local download."""
         active_profile = profile if profile is not None else self._active_profile()
@@ -216,7 +230,7 @@ class YouTubeCoverReviewService:
                 "model": str(active_profile["model"]),
                 "temperature": float(active_profile.get("temperature") or 0),
                 "messages": [
-                    {"role": "system", "content": self._SYSTEM_PROMPT},
+                    {"role": "system", "content": self.build_system_prompt(intensity)},
                     {"role": "user", "content": [
                         {"type": "text", "text": f"请检测这张视频封面。视频标题仅作参考：{video.title}"},
                         {"type": "image_url", "image_url": {"url": url}},
@@ -254,6 +268,7 @@ class YouTubeCoverReviewService:
         task_control: TaskControl | None = None,
         prefer_url: bool = False,
         concurrency: int | None = None,
+        intensity: str = "standard",
     ) -> tuple[list[CoverReviewResult], bool]:
         profile = self._active_profile()
         results: list[CoverReviewResult] = []
@@ -283,6 +298,7 @@ class YouTubeCoverReviewService:
                         video,
                         str(cover_paths.get(video.video_id) or ""),
                         profile=profile,
+                        intensity=intensity,
                     ): video
                     for video in batch
                 }

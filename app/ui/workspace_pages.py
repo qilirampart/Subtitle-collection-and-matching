@@ -34,8 +34,63 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.services.youtube_cover_review_service import YouTubeCoverReviewService
+
 
 Navigate = Callable[[str], None]
+
+
+def load_cover_items_from_workbook(path: Path) -> list[dict[str, object]]:
+    """Load cover-review queue items from a workbook with common YouTube headers."""
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("导入 Excel 需要安装 openpyxl。") from exc
+    aliases = {
+        "video_id": {"视频 ID", "视频ID", "video_id", "video id", "id"},
+        "title": {"视频标题", "标题", "title"},
+        "source_url": {"原视频链接", "原视频地址", "视频链接", "source_url", "url"},
+        "channel_id": {"频道 ID", "频道ID", "channel_id"},
+        "channel": {"频道名", "频道", "channel", "channel_name"},
+        "thumbnail_url": {"封面 CDN 地址", "封面CDN地址", "thumbnail_url", "thumbnail"},
+        "cover_path": {"封面文件", "封面路径", "cover_path"},
+    }
+    workbook = load_workbook(path, read_only=False, data_only=True)
+    try:
+        worksheet = workbook.active
+        header_row = next(worksheet.iter_rows(min_row=1, max_row=1, values_only=True), ())
+        normalized = {str(value or "").strip().lower(): index for index, value in enumerate(header_row)}
+        indexes: dict[str, int] = {}
+        for field, names in aliases.items():
+            for name in names:
+                if name.lower() in normalized:
+                    indexes[field] = normalized[name.lower()]
+                    break
+        if "video_id" not in indexes:
+            raise ValueError("Excel 中未找到“视频 ID”列，无法导入封面检测任务。")
+        items: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for row in worksheet.iter_rows(min_row=2, values_only=True):
+            video_id = str(row[indexes["video_id"]] or "").strip()
+            if not video_id or video_id in seen:
+                continue
+            seen.add(video_id)
+            video = {
+                "video_id": video_id,
+                "source_url": str(row[indexes.get("source_url", -1)] or "").strip() if "source_url" in indexes else f"https://www.youtube.com/watch?v={video_id}",
+                "title": str(row[indexes.get("title", -1)] or "").strip() if "title" in indexes else video_id,
+                "channel": str(row[indexes.get("channel", -1)] or "").strip() if "channel" in indexes else "",
+                "channel_id": str(row[indexes.get("channel_id", -1)] or "").strip() if "channel_id" in indexes else "",
+                "thumbnail_url": str(row[indexes.get("thumbnail_url", -1)] or "").strip() if "thumbnail_url" in indexes else "",
+            }
+            cover_path = str(row[indexes["cover_path"]] or "").strip() if "cover_path" in indexes else ""
+            items.append({"video": video, "cover_path": cover_path, "review": {}})
+        if not items:
+            raise ValueError("Excel 中没有可导入的视频 ID。")
+        return items
+    finally:
+        del worksheet
+        workbook.close()
 
 
 def _channel_urls_from_file(path: Path) -> list[str]:
@@ -378,6 +433,7 @@ class TaskCenterPage(QWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setMinimumHeight(240)
         root.addWidget(self.table, 1)
+        self._last_rows_signature: tuple[tuple[str, ...], ...] | None = None
 
         actions = QHBoxLayout()
         open_button = QPushButton("打开全流程任务页")
@@ -391,6 +447,15 @@ class TaskCenterPage(QWidget):
         active = bool(snapshot.get("active"))
         status = str(snapshot.get("status") or "当前没有运行任务")
         self._summary.setText(status)
+        lanes = snapshot.get("lanes") if isinstance(snapshot.get("lanes"), dict) else {}
+
+        def lane(name: str) -> dict[str, object]:
+            value = lanes.get(name)
+            return value if isinstance(value, dict) else {}
+
+        cover = lane("cover_lane")
+        subtitle = lane("subtitle_lane")
+        matching = lane("matching_lane")
         rows = (
             ("视频队列", "已就绪" if snapshot.get("videos") else "等待采集", snapshot.get("videos", 0), snapshot.get("videos", 0), 0),
             (
@@ -400,11 +465,15 @@ class TaskCenterPage(QWidget):
                 snapshot.get("download_completed", 0),
                 max(0, int(snapshot.get("downloads", 0)) - int(snapshot.get("download_completed", 0))),
             ),
-            ("字幕获取", "处理中" if active and snapshot.get("task_kind") == "字幕获取" else "等待处理", snapshot.get("videos", 0), snapshot.get("ready", 0), snapshot.get("fallback", 0)),
-            ("ASR 兜底", "处理中" if active and snapshot.get("task_kind") == "ASR 兜底" else "按需执行", snapshot.get("fallback", 0), snapshot.get("ready", 0), snapshot.get("fallback", 0)),
-            ("封面检测", "处理中" if active and snapshot.get("task_kind") == "封面检测" else "按需执行", snapshot.get("videos", 0), snapshot.get("reviews", 0), 0),
-            ("匹配核验", "处理中" if active and snapshot.get("task_kind") == "匹配核验" else "等待提交", snapshot.get("ready", 0), 0, snapshot.get("ready", 0)),
+            ("字幕通道", str(subtitle.get("status") or ("处理中" if active and "字幕" in str(snapshot.get("task_kind") or "") else "等待处理")), snapshot.get("videos", 0), snapshot.get("ready", 0), snapshot.get("fallback", 0)),
+            ("ASR 兜底", "处理中" if subtitle.get("active") and subtitle.get("stage") == "asr_fallback" else "按需执行", snapshot.get("fallback", 0), snapshot.get("ready", 0), snapshot.get("fallback", 0)),
+            ("封面通道", str(cover.get("status") or ("处理中" if cover.get("active") else "等待处理")), snapshot.get("videos", 0), snapshot.get("reviews", 0), 0),
+            ("匹配通道", str(matching.get("status") or ("处理中" if matching.get("active") else "等待提交")), snapshot.get("ready", 0), 0, snapshot.get("ready", 0)),
         )
+        signature = tuple(tuple(str(value) for value in row) for row in rows)
+        if signature == self._last_rows_signature:
+            return
+        self._last_rows_signature = signature
         self.table.setRowCount(len(rows))
         for row, values in enumerate(rows):
             for column, value in enumerate(values):
@@ -1342,6 +1411,7 @@ class CoverPage(QWidget):
         self,
         *,
         import_videos: Callable[[], list[dict[str, object]]],
+        import_workbook: Callable[[], list[dict[str, object]]],
         collect_channels: Callable[[list[str], int], None],
         start_review: Callable[[list[dict[str, object]]], None],
         start_url_review: Callable[[list[dict[str, object]]], None],
@@ -1354,6 +1424,7 @@ class CoverPage(QWidget):
     ) -> None:
         super().__init__(parent)
         self._import_videos = import_videos
+        self._import_workbook = import_workbook
         self._collect_channels = collect_channels
         self._start_review = start_review
         self._start_url_review = start_url_review
@@ -1401,6 +1472,11 @@ class CoverPage(QWidget):
         import_button.setProperty("secondary", True)
         import_button.clicked.connect(self._load_videos)
         action_row.addWidget(import_button)
+        workbook_button = QPushButton("导入 Excel 待检测")
+        workbook_button.setProperty("secondary", True)
+        workbook_button.setToolTip("从 Excel 读取视频 ID、封面地址等信息，加入当前封面检测队列。")
+        workbook_button.clicked.connect(self._load_workbook)
+        action_row.addWidget(workbook_button)
         self.download_check = QCheckBox("自动获取封面")
         self.download_check.setChecked(True)
         self.detect_check = QCheckBox("获取后检测封面")
@@ -1423,6 +1499,24 @@ class CoverPage(QWidget):
         self.item_count_label = QLabel("当前 0 条")
         action_row.addWidget(self.item_count_label)
         source_layout.addLayout(action_row)
+        prompt_row = QHBoxLayout()
+        prompt_row.addWidget(QLabel("检测强度"))
+        self.review_intensity_combo = QComboBox()
+        self.review_intensity_combo.addItem("保守", "conservative")
+        self.review_intensity_combo.addItem("标准（默认）", "standard")
+        self.review_intensity_combo.addItem("严格", "strict")
+        self.review_intensity_combo.setCurrentIndex(1)
+        self.review_intensity_combo.setToolTip("调整风险识别敏感度；固定检测协议和结果格式不可修改。")
+        self.review_intensity_combo.currentIndexChanged.connect(self._update_prompt_preview)
+        prompt_row.addWidget(self.review_intensity_combo)
+        prompt_row.addWidget(QLabel("当前提示词（只读）"))
+        self.prompt_preview = QPlainTextEdit()
+        self.prompt_preview.setReadOnly(True)
+        self.prompt_preview.setMinimumHeight(96)
+        self.prompt_preview.setMaximumHeight(150)
+        prompt_row.addWidget(self.prompt_preview, 1)
+        source_layout.addLayout(prompt_row)
+        self._update_prompt_preview()
         root.addWidget(source_card)
 
         queue_card = QFrame()
@@ -1554,6 +1648,23 @@ class CoverPage(QWidget):
 
     def _load_videos(self) -> None:
         self.set_items(self._import_videos())
+
+    def _load_workbook(self) -> None:
+        try:
+            items = self._import_workbook()
+        except (OSError, ValueError, RuntimeError) as exc:
+            QMessageBox.warning(self, "导入失败", str(exc))
+            return
+        if not items:
+            return
+        self.set_items(items)
+        self.set_status(f"已从 Excel 导入 {len(items)} 条待检测视频，可先下载封面再检测。")
+
+    def review_intensity(self) -> str:
+        return str(self.review_intensity_combo.currentData() or "standard")
+
+    def _update_prompt_preview(self) -> None:
+        self.prompt_preview.setPlainText(YouTubeCoverReviewService.build_system_prompt(self.review_intensity()))
 
     @property
     def items(self) -> list[dict[str, object]]:

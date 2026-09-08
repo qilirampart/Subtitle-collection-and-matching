@@ -63,6 +63,7 @@ from app.services.review_excel_exporter import (
     export_matching_results_to_xlsx,
 )
 from app.services.proxy_discovery_service import ProxyDiscoveryService
+from app.services.resource_governor import ResourceGovernor
 from app.services.api_config_service import ApiConfigService
 from app.services.update_service import ApplicationUpdateService, AvailableUpdate
 from app.services.youtube_audio_service import YouTubeAudioService
@@ -86,6 +87,7 @@ from app.ui.workspace_pages import (
     SettingsHubPage,
     SubtitlePage,
     TaskCenterPage,
+    load_cover_items_from_workbook,
 )
 from app.task_control import TaskControl
 from app.utils.logger import get_logger
@@ -174,13 +176,16 @@ class _CollectThread(QThread):
     succeeded = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, url: str, limit: int) -> None:
+    def __init__(self, url: str, limit: int, control: TaskControl | None = None) -> None:
         super().__init__()
         self.url = url
         self.limit = limit
+        self.control = control
 
     def run(self) -> None:
         try:
+            if self.control is not None and not self.control.checkpoint():
+                return
             self.succeeded.emit(VerificationWorkflow().collector.collect_channel(self.url, max_items=self.limit))
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
@@ -294,13 +299,14 @@ class _CoverReviewThread(QThread):
     failed = Signal(str)
     progress = Signal(int, int, object, object)
 
-    def __init__(self, videos: list[YouTubeVideo], cover_paths: dict[str, str], control: TaskControl, *, prefer_url: bool = False, concurrency: int | None = None) -> None:
+    def __init__(self, videos: list[YouTubeVideo], cover_paths: dict[str, str], control: TaskControl, *, prefer_url: bool = False, concurrency: int | None = None, intensity: str = "standard") -> None:
         super().__init__()
         self.videos = videos
         self.cover_paths = cover_paths
         self.control = control
         self.prefer_url = prefer_url
         self.concurrency = concurrency
+        self.intensity = intensity
 
     def run(self) -> None:
         try:
@@ -313,6 +319,7 @@ class _CoverReviewThread(QThread):
                 ),
                 prefer_url=self.prefer_url,
                 concurrency=self.concurrency,
+                intensity=self.intensity,
             )
             (self.cancelled if was_cancelled else self.succeeded).emit(results)
         except Exception as exc:  # noqa: BLE001
@@ -964,6 +971,12 @@ class MainWindow(QMainWindow):
         self._match_paused = False
         self._task_control: TaskControl | None = None
         self._thread: QThread | None = None
+        # Cover collection/download is an independent local lane.  It must
+        # not occupy the subtitle/ASR worker slot or its pause control.
+        self._cover_control: TaskControl | None = None
+        self._cover_thread: QThread | None = None
+        self._subtitle_control: TaskControl | None = None
+        self._subtitle_thread: QThread | None = None
         # The matching service owns its queue; keep it independent from local workers.
         self._matching_thread: _MatchThread | None = None
         self._parallel_cover_review_thread: _CoverReviewThread | None = None
@@ -981,6 +994,7 @@ class MainWindow(QMainWindow):
         self._update_download_thread: _UpdateDownloadThread | None = None
         self._update_progress_dialog: QProgressDialog | None = None
         self._api_config_service = ApiConfigService()
+        self._resource_governor = ResourceGovernor()
         self._standalone_download_results: list[dict[str, object]] = []
         self._task_spec: dict[str, object] = {}
         self._resume_auto_asr = False
@@ -1469,6 +1483,7 @@ class MainWindow(QMainWindow):
         )
         self._cover_page = CoverPage(
             import_videos=self._import_cover_items,
+            import_workbook=self._import_cover_workbook,
             collect_channels=self._collect_cover_channels,
             start_review=self._start_cover_page_review,
             start_url_review=self._start_cover_page_url_review,
@@ -1677,23 +1692,24 @@ class MainWindow(QMainWindow):
         local_busy = bool(busy) if scope == "local" else self._thread_is_running()
         matching_busy = bool(busy) if scope == "matching" else self._matching_thread_is_running()
         parallel_cover_running = self._parallel_cover_review_is_running()
+        cover_busy = bool(busy) if scope == "cover" else self._cover_lane_is_running()
         self._refresh_dashboard_metrics()
         self.collect_button.setEnabled(not local_busy)
         if hasattr(self, "_download_page"):
             self._download_page.set_busy(local_busy)
         if hasattr(self, "_cover_page"):
             self._cover_page.set_busy(
-                local_busy or parallel_cover_running or self._cover_collect_thread is not None,
-                allow_review=local_busy and self._task_control is not None and self._task_control.paused,
+                cover_busy,
+                allow_review=cover_busy and self._cover_control is not None and self._cover_control.paused,
             )
         if hasattr(self, "_subtitle_page"):
             self._subtitle_page.set_busy(local_busy)
         if hasattr(self, "_matching_page"):
             self._matching_page.set_busy(matching_busy, submission_blocked=local_busy)
-        subtitle_preparing = isinstance(self._thread, _PrepareThread)
-        self.cover_button.setEnabled(not local_busy and bool(self._videos))
+        subtitle_preparing = isinstance(self._subtitle_thread, _PrepareThread) or isinstance(self._thread, _PrepareThread)
+        self.cover_button.setEnabled(not local_busy and not cover_busy and bool(self._videos))
         self.cover_review_button.setEnabled(
-            not parallel_cover_running
+            not cover_busy
             and (not local_busy or subtitle_preparing)
             and any(video.video_id in self._cover_paths for video in self._selected_videos())
         )
@@ -1741,17 +1757,30 @@ class MainWindow(QMainWindow):
     def _thread_is_running(self) -> bool:
         """Return worker state without touching a Qt thread wrapper already deleted by Qt."""
         thread = self._thread
-        if thread is None:
+        if thread is not None:
+            try:
+                if thread.isRunning():
+                    return True
+            except RuntimeError:
+                LOGGER.info("Discarding deleted worker thread reference.")
+                self._thread = None
+        subtitle_thread = self._subtitle_thread
+        if subtitle_thread is None:
             return False
         try:
-            return bool(thread.isRunning())
+            return bool(subtitle_thread.isRunning())
         except RuntimeError:
             # Existing workers use deleteLater() after completion. Keeping that
             # Python wrapper and probing it later raises here, which previously
             # aborted the next task before its thread could be started.
-            LOGGER.info("Discarding deleted worker thread reference.")
-            self._thread = None
+            LOGGER.info("Discarding deleted subtitle worker thread reference.")
+            self._subtitle_thread = None
             return False
+
+    def _finish_subtitle_thread(self, thread: QThread) -> None:
+        if self._subtitle_thread is thread:
+            self._subtitle_thread = None
+        thread.deleteLater()
 
     def _matching_thread_is_running(self) -> bool:
         thread = self._matching_thread
@@ -1763,6 +1792,37 @@ class MainWindow(QMainWindow):
             LOGGER.info("Discarding deleted matching worker thread reference.")
             self._matching_thread = None
             return False
+
+    def _cover_thread_is_running(self) -> bool:
+        thread = self._cover_thread
+        if thread is None:
+            return False
+        try:
+            return bool(thread.isRunning())
+        except RuntimeError:
+            LOGGER.info("Discarding deleted cover worker thread reference.")
+            self._cover_thread = None
+            return False
+
+    def _cover_lane_is_running(self) -> bool:
+        collect_running = self._cover_collection_is_running()
+        return bool(collect_running or self._cover_thread_is_running() or self._parallel_cover_review_is_running())
+
+    def _cover_collection_is_running(self) -> bool:
+        thread = self._cover_collect_thread
+        if thread is None:
+            return False
+        try:
+            return bool(thread.isRunning())
+        except RuntimeError:
+            LOGGER.info("Discarding deleted cover collection thread reference.")
+            self._cover_collect_thread = None
+            return False
+
+    def _finish_cover_thread(self, thread: QThread) -> None:
+        if self._cover_thread is thread:
+            self._cover_thread = None
+        thread.deleteLater()
 
     def _finish_matching_thread(self, thread: _MatchThread) -> None:
         if self._matching_thread is thread:
@@ -1926,7 +1986,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(150, QApplication.instance().quit)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        local_thread = self._thread
+        local_thread = self._thread or self._subtitle_thread
         if local_thread is not None and local_thread.isRunning():
             # Keep the durable snapshot active after cancellation so the next
             # launch can offer recovery.
@@ -1940,6 +2000,24 @@ class MainWindow(QMainWindow):
                     self,
                     "任务仍在停止",
                     "封面检测正在结束网络请求。\n任务状态已保存。是否强制退出？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if choice != QMessageBox.StandardButton.Yes:
+                    event.ignore()
+                    return
+
+        cover_thread = self._cover_thread or self._cover_collect_thread
+        if cover_thread is not None and cover_thread.isRunning():
+            self._closing_for_recovery = True
+            if self._cover_control is not None:
+                self._cover_control.cancel()
+            self._persist_workspace_state()
+            if not cover_thread.wait(5000):
+                choice = QMessageBox.question(
+                    self,
+                    "任务仍在停止",
+                    "封面任务正在结束网络请求。\n任务状态已保存。是否强制退出？",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No,
                 )
@@ -1990,29 +2068,52 @@ class MainWindow(QMainWindow):
             task_kind = "封面下载"
         elif isinstance(self._thread, _CoverReviewThread):
             task_kind = "封面检测"
-        elif isinstance(self._thread, _PrepareThread):
+        elif isinstance(self._thread, _PrepareThread) or isinstance(self._subtitle_thread, _PrepareThread):
             task_kind = "字幕获取"
-        elif isinstance(self._thread, _AsrFallbackThread):
+        elif isinstance(self._thread, _AsrFallbackThread) or isinstance(self._subtitle_thread, _AsrFallbackThread):
             task_kind = "ASR 兜底"
         elif isinstance(self._thread, _MatchThread):
             task_kind = "匹配核验"
         elif isinstance(self._thread, _StandaloneDownloadThread):
             task_kind = "视频下载"
-        elif isinstance(self._thread, _StandaloneSubtitleThread):
+        elif isinstance(self._thread, _StandaloneSubtitleThread) or isinstance(self._subtitle_thread, _StandaloneSubtitleThread):
             task_kind = "字幕转写"
-        elif isinstance(self._thread, _StandaloneCoverThread):
-            task_kind = "封面检测"
+        cover_thread = self._cover_thread
+        if isinstance(cover_thread, _CoverThread):
+            task_kind = f"{task_kind} + 封面下载" if task_kind else "封面下载"
+        elif isinstance(cover_thread, _StandaloneCoverThread):
+            task_kind = f"{task_kind} + 封面处理" if task_kind else "封面处理"
+        elif self._cover_collection_is_running():
+            task_kind = f"{task_kind} + 封面采集" if task_kind else "封面采集"
         matching_active = self._matching_thread_is_running()
         if matching_active:
             task_kind = f"{task_kind} + 匹配核验" if task_kind else "匹配核验"
         parallel_cover_active = self._parallel_cover_review_is_running()
         if parallel_cover_active:
             task_kind = f"{task_kind} + 封面检测" if task_kind else "封面检测"
-        active = self._thread_is_running() or matching_active or parallel_cover_active
+        active = self._thread_is_running() or matching_active or self._cover_lane_is_running()
         # Do not erase the recovery snapshot when a worker acknowledges
         # cancellation while the window is closing.
         if self._closing_for_recovery and (self._videos or self._pending_asr):
             active = True
+        subtitle_active = bool(self._subtitle_thread and self._subtitle_thread.isRunning())
+        cover_stage = ""
+        cover_status = ""
+        if self._cover_collection_is_running():
+            cover_stage, cover_status = "collect", "正在采集频道"
+        elif isinstance(self._cover_thread, _StandaloneCoverThread):
+            cover_stage, cover_status = "download", "正在处理封面"
+        elif isinstance(self._cover_thread, _CoverThread):
+            cover_stage, cover_status = "download", "正在下载封面"
+        elif parallel_cover_active:
+            cover_stage, cover_status = "review", "正在检测封面"
+        subtitle_stage = ""
+        if isinstance(self._subtitle_thread, _AsrFallbackThread):
+            subtitle_stage = "asr_fallback"
+        elif isinstance(self._subtitle_thread, _PrepareThread):
+            subtitle_stage = "prepare"
+        elif isinstance(self._subtitle_thread, (_CollectThread, _StandaloneSubtitleThread)):
+            subtitle_stage = "subtitle"
         ready_ids = {
             str(item.get("source_video_id") or "")
             for item in self._ready_items
@@ -2030,6 +2131,11 @@ class MainWindow(QMainWindow):
             "active": active,
             "task_kind": task_kind,
             "status": self.status_label.text() if hasattr(self, "status_label") else "当前没有运行任务",
+            "lanes": {
+                "cover_lane": {"active": self._cover_lane_is_running(), "stage": cover_stage, "status": cover_status},
+                "subtitle_lane": {"active": subtitle_active, "stage": subtitle_stage, "status": self._subtitle_page.status_label.text() if hasattr(self, "_subtitle_page") else ""},
+                "matching_lane": {"active": matching_active, "stage": "matching" if matching_active else "", "status": self._matching_page.status_label.text() if hasattr(self, "_matching_page") else ""},
+            },
         }
 
     def _refresh_workspace_pages(self) -> None:
@@ -2380,14 +2486,37 @@ class MainWindow(QMainWindow):
             for video in videos
         ]
 
+    def _import_cover_workbook(self) -> list[dict[str, object]]:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "导入封面检测 Excel",
+            str(PROJECT_ROOT),
+            "Excel 文件 (*.xlsx *.xlsm);;所有文件 (*.*)",
+        )
+        if not path:
+            return []
+        items = load_cover_items_from_workbook(Path(path))
+        existing_items = self._cover_page.items
+        existing = {
+            str(item.get("video", {}).get("video_id") or "")
+            for item in existing_items
+            if isinstance(item.get("video"), dict)
+        }
+        additions = [
+            item
+            for item in items
+            if str(item.get("video", {}).get("video_id") or "") not in existing
+        ]
+        return existing_items + additions
+
     def _collect_cover_channels(self, urls: list[str], limit: int) -> None:
-        if self._thread_is_running() or self._cover_collect_thread is not None and self._cover_collect_thread.isRunning():
+        if self._cover_lane_is_running():
             self._cover_page.set_status("已有任务正在运行，请等待完成或先取消。")
             return
         self._cover_page.set_busy(True)
         self._cover_page.set_status(f"正在采集频道：0/{len(urls)}...")
-        self._task_control = TaskControl()
-        thread = _CoverCollectThread(urls, limit, self._task_control)
+        self._cover_control = TaskControl()
+        thread = _CoverCollectThread(urls, limit, self._cover_control)
         self._cover_collect_thread = thread
         thread.progress.connect(
             lambda index, total, url, added, error: self._cover_page.set_status(
@@ -2405,8 +2534,8 @@ class MainWindow(QMainWindow):
     def _finish_cover_collection(self, thread: _CoverCollectThread) -> None:
         if self._cover_collect_thread is thread:
             self._cover_collect_thread = None
-        self._task_control = None
-        self._cover_page.set_busy(False)
+        self._cover_control = None
+        self._set_busy(False, scope="cover")
 
     def _on_cover_channels_collected(self, items: list[dict[str, object]]) -> None:
         if not self._cover_page.items:
@@ -2425,26 +2554,31 @@ class MainWindow(QMainWindow):
         download_cover: bool,
         detect_cover: bool,
     ) -> None:
-        if self._thread_is_running():
+        if self._cover_lane_is_running():
             self._cover_page.set_status("已有封面任务正在运行，请先暂停或取消当前任务。")
             QMessageBox.information(self, "任务进行中", "请等待当前任务完成，或先暂停/取消当前任务。")
             return
-        self._task_control = TaskControl()
+        self._cover_control = TaskControl()
         self._standalone_cover_progress_total = len(items)
         self._standalone_cover_progress_completed = 0
-        self._set_busy(True)
+        self._set_busy(True, scope="cover")
         self.status_label.setText(f"正在处理 {len(items)} 条封面素材...")
         self._cover_page.set_status(f"正在处理 0/{len(items)} 条封面素材...")
         self._set_cover_progress(0, len(items), "封面处理")
-        self._thread = _StandaloneCoverThread(
-            items, download_cover, detect_cover, self._task_control,
-            download_concurrency=int(self._cover_page.download_concurrency_combo.currentData() or 1),
+        thread = _StandaloneCoverThread(
+            items, download_cover, detect_cover, self._cover_control,
+            download_concurrency=self._resource_governor.clamp(
+                "cover_download",
+                int(self._cover_page.download_concurrency_combo.currentData() or 1),
+                asr_active=isinstance(self._subtitle_thread, _AsrFallbackThread),
+            ),
         )
-        self._thread.item_updated.connect(self._on_standalone_cover_item)
-        self._thread.completed.connect(self._on_standalone_cover_completed)
-        self._thread.failed.connect(self._on_worker_failed)
-        self._thread.finished.connect(self._thread.deleteLater)
-        self._thread.start()
+        self._cover_thread = thread
+        thread.item_updated.connect(self._on_standalone_cover_item)
+        thread.completed.connect(self._on_standalone_cover_completed)
+        thread.failed.connect(self._on_cover_worker_failed)
+        thread.finished.connect(lambda: self._finish_cover_thread(thread))
+        thread.start()
         self._cover_page.pause_button.setEnabled(True)
         self._cover_page.cancel_button.setEnabled(True)
 
@@ -2471,7 +2605,12 @@ class MainWindow(QMainWindow):
             return
         self._start_parallel_cover_review(
             videos,
-            concurrency=self._cover_page.review_concurrency_combo.currentData(),
+            concurrency=self._resource_governor.clamp(
+                "cover_review",
+                int(self._cover_page.review_concurrency_combo.currentData() or 1),
+                asr_active=isinstance(self._subtitle_thread, _AsrFallbackThread),
+            ),
+            intensity=self._cover_page.review_intensity(),
         )
 
     def _start_cover_page_url_review(self, items: list[dict[str, object]]) -> None:
@@ -2492,7 +2631,7 @@ class MainWindow(QMainWindow):
         if self._parallel_cover_review_is_running():
             self._cover_page.set_status("已有封面检测任务正在运行。")
             return
-        self._start_parallel_cover_review(videos, prefer_url=True)
+        self._start_parallel_cover_review(videos, prefer_url=True, intensity=self._cover_page.review_intensity())
 
     def _remove_cover_queue_items(self, video_ids: set[str]) -> None:
         ids = {str(video_id or "") for video_id in video_ids if str(video_id or "")}
@@ -2558,7 +2697,7 @@ class MainWindow(QMainWindow):
         self._refresh_cover_review_table()
         self._cover_page.refresh_stage_views()
         self._cover_page.set_items(self._cover_page.items)
-        self._task_control = None
+        self._cover_control = None
         self._cover_page.pause_button.setText("暂停")
         message = (
             f"封面任务已取消，已完成 {len(results)} 条。"
@@ -2568,7 +2707,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(message)
         self._cover_page.set_status(message)
         self._set_cover_progress(len(results), len(results), "封面处理完成" if not cancelled else "封面处理已取消")
-        self._set_busy(False)
+        self._set_busy(False, scope="cover")
 
     def _start_standalone_transcription(
         self,
@@ -2580,23 +2719,25 @@ class MainWindow(QMainWindow):
         if self._thread_is_running():
             QMessageBox.information(self, "任务进行中", "请等待当前任务完成，或先暂停/取消当前任务。")
             return
-        self._task_control = TaskControl()
+        self._subtitle_control = TaskControl()
+        self._task_control = self._subtitle_control
         self._set_busy(True)
         mode = "直接下载并 ASR 转写" if skip_caption_probe else "获取字幕并按需转写"
         self.status_label.setText(f"正在处理 {len(sources)} 条字幕素材（{mode}）...")
         self._subtitle_page.set_status(f"正在处理 0/{len(sources)} 条素材...")
-        self._thread = _StandaloneSubtitleThread(
+        thread = _StandaloneSubtitleThread(
             sources,
             seconds,
             allow_asr_fallback,
-            self._task_control,
+            self._subtitle_control,
             skip_caption_probe=skip_caption_probe,
         )
-        self._thread.item_updated.connect(self._on_standalone_subtitle_item)
-        self._thread.completed.connect(self._on_standalone_subtitle_completed)
-        self._thread.failed.connect(self._on_worker_failed)
-        self._thread.finished.connect(self._thread.deleteLater)
-        self._thread.start()
+        self._subtitle_thread = thread
+        thread.item_updated.connect(self._on_standalone_subtitle_item)
+        thread.completed.connect(self._on_standalone_subtitle_completed)
+        thread.failed.connect(self._on_worker_failed)
+        thread.finished.connect(lambda: self._finish_subtitle_thread(thread))
+        thread.start()
 
     def _on_standalone_subtitle_item(self, row: int, status: str, source_kind: str, text: str) -> None:
         self._subtitle_page.update_job(row, status, source_kind, text)
@@ -2790,11 +2931,14 @@ class MainWindow(QMainWindow):
             return
         self._set_busy(True)
         self.status_label.setText("正在采集公开视频目录...")
-        self._thread = _CollectThread(url, self.limit_spin.value())
-        self._thread.succeeded.connect(self._on_collected)
-        self._thread.failed.connect(self._on_worker_failed)
-        self._thread.finished.connect(self._thread.deleteLater)
-        self._thread.start()
+        self._subtitle_control = TaskControl()
+        self._task_control = self._subtitle_control
+        thread = _CollectThread(url, self.limit_spin.value(), self._subtitle_control)
+        self._subtitle_thread = thread
+        thread.succeeded.connect(self._on_collected)
+        thread.failed.connect(self._on_worker_failed)
+        thread.finished.connect(lambda: self._finish_subtitle_thread(thread))
+        thread.start()
 
     def _on_collected(self, videos: list[YouTubeVideo]) -> None:
         existing_ids = {video.video_id for video in self._videos}
@@ -3098,7 +3242,10 @@ class MainWindow(QMainWindow):
 
     def _toggle_pause(self) -> None:
         sender = self.sender()
-        if self._parallel_cover_review_is_running() and sender is self._cover_page.pause_button:
+        if self._parallel_cover_review_is_running() and (
+            sender is self._cover_page.pause_button
+            or (sender is self.pause_button and not self._thread_is_running() and not self._matching_thread_is_running())
+        ):
             control = self._parallel_cover_review_control
             if control is not None:
                 if control.paused:
@@ -3109,6 +3256,22 @@ class MainWindow(QMainWindow):
                     control.pause()
                     self._cover_page.pause_button.setText("继续")
                     self._cover_page.set_status("已请求暂停封面检测，将在当前请求结束后暂停。")
+            return
+        cover_control = sender is self._cover_page.pause_button or (
+            sender is self.pause_button
+            and self._cover_lane_is_running()
+            and not self._thread_is_running()
+            and not self._matching_thread_is_running()
+        )
+        if cover_control and self._cover_control is not None and not self._cover_control.cancelled:
+            if self._cover_control.paused:
+                self._cover_control.resume()
+                self._cover_page.pause_button.setText("暂停")
+                self._cover_page.set_status("封面任务已继续。")
+            else:
+                self._cover_control.pause()
+                self._cover_page.pause_button.setText("继续")
+                self._cover_page.set_status("将在当前封面请求结束后暂停。")
             return
         matching_page_control = sender in {
             self._matching_page.pause_button,
@@ -3142,12 +3305,6 @@ class MainWindow(QMainWindow):
             self._task_control.resume()
             self.pause_button.setText("暂停")
             self.status_label.setText("任务已继续，将在当前视频处理完成后更新进度。")
-            if self._cover_collect_thread is not None:
-                self._cover_page.pause_button.setText("暂停")
-                self._cover_page.set_status("采集任务已继续。")
-            if self._thread is not None and isinstance(self._thread, _StandaloneCoverThread):
-                self._cover_page.pause_button.setText("暂停")
-                self._cover_page.set_status("封面下载任务已继续。")
             if isinstance(self._thread, _StandaloneDownloadThread):
                 self._download_page.pause_button.setText("暂停")
                 self._download_page.set_status("下载任务已继续。")
@@ -3158,12 +3315,6 @@ class MainWindow(QMainWindow):
             self._task_control.pause()
             self.pause_button.setText("继续")
             self.status_label.setText("将在当前视频处理完成后暂停。")
-            if self._cover_collect_thread is not None:
-                self._cover_page.pause_button.setText("继续")
-                self._cover_page.set_status("将在当前频道采集完成后暂停。")
-            if self._thread is not None and isinstance(self._thread, _StandaloneCoverThread):
-                self._cover_page.pause_button.setText("继续")
-                self._cover_page.set_status("将在当前下载请求结束后暂停。")
             if isinstance(self._thread, _StandaloneDownloadThread):
                 self._download_page.pause_button.setText("继续")
                 self._download_page.set_status("将在当前下载检查点暂停。")
@@ -3178,8 +3329,28 @@ class MainWindow(QMainWindow):
             self._matching_page.cancel_button,
         }
         if self._parallel_cover_review_control is not None and self._parallel_cover_review_is_running():
-            if not matching_page_control:
+            if sender is self._cover_page.cancel_button or (
+                sender is self.cancel_task_button
+                and not self._thread_is_running()
+                and not self._matching_thread_is_running()
+            ):
                 self._parallel_cover_review_control.cancel()
+                self._cover_page.pause_button.setEnabled(False)
+                self._cover_page.cancel_button.setEnabled(False)
+                self._cover_page.set_status("正在取消封面检测，当前模型请求结束后停止。")
+                return
+        cover_control = sender is self._cover_page.cancel_button or (
+            sender is self.cancel_task_button
+            and self._cover_lane_is_running()
+            and not self._thread_is_running()
+            and not self._matching_thread_is_running()
+        )
+        if cover_control and self._cover_control is not None:
+            self._cover_control.cancel()
+            self._cover_page.pause_button.setEnabled(False)
+            self._cover_page.cancel_button.setEnabled(False)
+            self._cover_page.set_status("正在取消封面任务，当前请求结束后停止。")
+            return
         matching_control = matching_page_control or (
             sender is self.cancel_task_button
             and self._matching_thread_is_running()
@@ -3201,14 +3372,9 @@ class MainWindow(QMainWindow):
             self._browser_capture_dialog.reject()
         self.pause_button.setEnabled(False)
         self.cancel_task_button.setEnabled(False)
-        if isinstance(self._thread, _StandaloneCoverThread):
-            self._cover_page.pause_button.setEnabled(False)
-            self._cover_page.cancel_button.setEnabled(False)
         self.status_label.setText("正在取消任务，当前视频完成后将停止。")
         if isinstance(self._thread, _StandaloneDownloadThread):
             self._download_page.set_status("正在取消下载任务，当前请求结束后停止。")
-        if isinstance(self._thread, _StandaloneCoverThread):
-            self._cover_page.set_status("正在取消封面下载，当前请求结束后停止。")
         if isinstance(self._thread, _StandaloneSubtitleThread):
             self._subtitle_page.set_status("正在取消字幕任务，当前素材处理结束后停止。")
 
@@ -3295,23 +3461,27 @@ class MainWindow(QMainWindow):
         if not videos:
             QMessageBox.warning(self, "没有选择", "请至少勾选一条视频后下载封面。")
             return
+        if self._cover_lane_is_running():
+            QMessageBox.information(self, "封面任务进行中", "当前已有封面任务正在执行。")
+            return
         LOGGER.info("Cover download task requested. selected_count=%s", len(videos))
         selected_ids = {item.video_id for item in videos}
         for row, video in enumerate(self._videos):
             if video.video_id in selected_ids:
                 self.video_table.setItem(row, 5, QTableWidgetItem("等待下载"))
-        self._task_control = TaskControl()
-        self._set_busy(True)
+        self._cover_control = TaskControl()
+        self._set_busy(True, scope="cover")
         self.status_label.setText(f"正在下载公开视频封面：0/{len(videos)}")
         self._set_cover_progress(0, len(videos), "封面下载")
-        self._thread = _CoverThread(videos, self._task_control)
-        self._thread.started.connect(self._on_cover_started)
-        self._thread.progress.connect(self._on_cover_progress)
-        self._thread.succeeded.connect(self._on_covers_downloaded)
-        self._thread.cancelled.connect(self._on_covers_cancelled)
-        self._thread.failed.connect(self._on_worker_failed)
-        self._thread.finished.connect(self._thread.deleteLater)
-        self._thread.start()
+        thread = _CoverThread(videos, self._cover_control)
+        self._cover_thread = thread
+        thread.started.connect(self._on_cover_started)
+        thread.progress.connect(self._on_cover_progress)
+        thread.succeeded.connect(self._on_covers_downloaded)
+        thread.cancelled.connect(self._on_covers_cancelled)
+        thread.failed.connect(self._on_cover_worker_failed)
+        thread.finished.connect(lambda: self._finish_cover_thread(thread))
+        thread.start()
 
     def _on_cover_button_pressed(self) -> None:
         selected_count = len(self._selected_videos())
@@ -3350,21 +3520,21 @@ class MainWindow(QMainWindow):
     def _on_covers_downloaded(self, results: list[CoverDownloadResult]) -> None:
         success_count = sum(1 for result in results if result.path)
         failure_count = len(results) - success_count
-        self._task_control = None
+        self._cover_control = None
         self.pause_button.setText("暂停")
         self.status_label.setText(
             f"封面下载完成：成功 {success_count} 条，失败 {failure_count} 条。"
         )
         self._set_cover_progress(len(results), len(results), "封面下载完成")
-        self._set_busy(False)
+        self._set_busy(False, scope="cover")
 
     def _on_covers_cancelled(self, results: list[CoverDownloadResult]) -> None:
         success_count = sum(1 for result in results if result.path)
-        self._task_control = None
+        self._cover_control = None
         self.pause_button.setText("暂停")
         self.status_label.setText(f"封面下载已取消，已保留 {success_count} 条成功封面。")
         self._set_cover_progress(len(results), len(self._videos), "封面下载已取消")
-        self._set_busy(False)
+        self._set_busy(False, scope="cover")
 
     def _set_cover_progress(self, completed: int, total: int, label: str) -> None:
         total = max(1, int(total or 1))
@@ -3377,30 +3547,15 @@ class MainWindow(QMainWindow):
         if not videos:
             QMessageBox.information(self, "没有可检测封面", "请先下载并勾选需要检测的封面。")
             return
-        if self._parallel_cover_review_is_running():
+        if self._cover_lane_is_running():
             QMessageBox.information(self, "封面检测进行中", "当前已有封面检测任务正在执行。")
             return
-        if self._thread_is_running():
-            if not isinstance(self._thread, _PrepareThread):
-                QMessageBox.information(self, "任务进行中", "封面检测只能与字幕获取同步执行，请等待当前任务完成。")
-                return
-            self._start_parallel_cover_review(videos)
-            return
-        self._task_control = TaskControl()
-        self._set_busy(True)
-        self.status_label.setText(f"正在检测封面：0/{len(videos)}")
-        self._thread = _CoverReviewThread(videos, self._cover_paths, self._task_control)
-        self._thread.progress.connect(self._on_cover_review_progress)
-        self._thread.succeeded.connect(self._on_cover_review_finished)
-        self._thread.cancelled.connect(self._on_cover_review_cancelled)
-        self._thread.failed.connect(self._on_worker_failed)
-        self._thread.finished.connect(self._thread.deleteLater)
-        self._thread.start()
+        self._start_parallel_cover_review(videos, intensity=self._cover_page.review_intensity())
 
-    def _start_parallel_cover_review(self, videos: list[YouTubeVideo], *, prefer_url: bool = False, concurrency: int | None = None) -> None:
+    def _start_parallel_cover_review(self, videos: list[YouTubeVideo], *, prefer_url: bool = False, concurrency: int | None = None, intensity: str = "standard") -> None:
         """Run cover-model calls beside subtitle acquisition without replacing its worker."""
         control = TaskControl()
-        thread = _CoverReviewThread(videos, self._cover_paths, control, prefer_url=prefer_url, concurrency=concurrency)
+        thread = _CoverReviewThread(videos, self._cover_paths, control, prefer_url=prefer_url, concurrency=concurrency, intensity=intensity)
         self._parallel_cover_review_control = control
         self._parallel_cover_review_thread = thread
         thread.progress.connect(self._on_parallel_cover_review_progress)
@@ -3585,7 +3740,8 @@ class MainWindow(QMainWindow):
         )
         self._active_video_ids = {video.video_id for video in videos}
         self._completed_video_ids = set()
-        self._task_control = TaskControl()
+        self._subtitle_control = TaskControl()
+        self._task_control = self._subtitle_control
         self._set_busy(True)
         auto_asr = self.auto_asr_fallback_check.isChecked()
         self._task_spec = {
@@ -3593,28 +3749,29 @@ class MainWindow(QMainWindow):
             "leading_seconds": int(self.seconds_combo.currentData()),
             "allow_asr_fallback": bool(auto_asr or skip_caption_probe),
             "skip_caption_probe": bool(skip_caption_probe),
-            "caption_concurrency": int(self.caption_concurrency_combo.currentData()),
-            "download_concurrency": int(self.asr_download_concurrency_combo.currentData()),
-            "asr_concurrency": int(self.asr_transcribe_concurrency_combo.currentData()),
+            "caption_concurrency": self._resource_governor.clamp("subtitle_caption", int(self.caption_concurrency_combo.currentData())),
+            "download_concurrency": self._resource_governor.clamp("audio_download", int(self.asr_download_concurrency_combo.currentData())),
+            "asr_concurrency": self._resource_governor.clamp("asr", int(self.asr_transcribe_concurrency_combo.currentData())),
         }
-        self._thread = _PrepareThread(
+        thread = _PrepareThread(
             videos,
             int(self.seconds_combo.currentData()),
-            self._task_control,
+            self._subtitle_control,
             allow_asr_fallback=auto_asr or skip_caption_probe,
             skip_caption_probe=skip_caption_probe,
-            caption_concurrency=int(self.caption_concurrency_combo.currentData()),
-            download_concurrency=int(self.asr_download_concurrency_combo.currentData()),
-            asr_concurrency=int(self.asr_transcribe_concurrency_combo.currentData()),
+            caption_concurrency=self._resource_governor.clamp("subtitle_caption", int(self.caption_concurrency_combo.currentData())),
+            download_concurrency=self._resource_governor.clamp("audio_download", int(self.asr_download_concurrency_combo.currentData())),
+            asr_concurrency=self._resource_governor.clamp("asr", int(self.asr_transcribe_concurrency_combo.currentData())),
         )
-        self._thread.succeeded.connect(self._on_prepared)
-        self._thread.progress.connect(self._on_prepare_progress)
-        self._thread.stage.connect(self._on_asr_stage)
-        self._thread.cancelled.connect(self._on_task_cancelled)
-        self._thread.failed.connect(self._on_worker_failed)
-        self._thread.finished.connect(self._thread.deleteLater)
+        self._subtitle_thread = thread
+        thread.succeeded.connect(self._on_prepared)
+        thread.progress.connect(self._on_prepare_progress)
+        thread.stage.connect(self._on_asr_stage)
+        thread.cancelled.connect(self._on_task_cancelled)
+        thread.failed.connect(self._on_worker_failed)
+        thread.finished.connect(lambda: self._finish_subtitle_thread(thread))
         self._set_busy(True)
-        self._thread.start()
+        thread.start()
         if self.auto_cover_review_check.isChecked():
             cover_videos = [video for video in videos if video.video_id in self._cover_paths]
             if cover_videos:
@@ -3892,29 +4049,31 @@ class MainWindow(QMainWindow):
             if isinstance(item, dict)
             and str((item.get("video") or {}).get("video_id") or "")
         }
-        self._task_control = TaskControl()
+        self._subtitle_control = TaskControl()
+        self._task_control = self._subtitle_control
         self._task_spec = {
             "kind": "asr_fallback",
             "leading_seconds": int(self.seconds_combo.currentData()),
-            "download_concurrency": int(self.asr_download_concurrency_combo.currentData()),
-            "asr_concurrency": int(self.asr_transcribe_concurrency_combo.currentData()),
+            "download_concurrency": self._resource_governor.clamp("audio_download", int(self.asr_download_concurrency_combo.currentData())),
+            "asr_concurrency": self._resource_governor.clamp("asr", int(self.asr_transcribe_concurrency_combo.currentData())),
         }
         self._set_busy(True)
-        self._thread = _AsrFallbackThread(
+        thread = _AsrFallbackThread(
             pending_items,
             int(self.seconds_combo.currentData()),
-            self._task_control,
+            self._subtitle_control,
             audio_sources,
-            int(self.asr_download_concurrency_combo.currentData()),
-            int(self.asr_transcribe_concurrency_combo.currentData()),
+            self._resource_governor.clamp("audio_download", int(self.asr_download_concurrency_combo.currentData())),
+            self._resource_governor.clamp("asr", int(self.asr_transcribe_concurrency_combo.currentData())),
         )
-        self._thread.succeeded.connect(self._on_asr_fallback_finished)
-        self._thread.progress.connect(self._on_asr_progress)
-        self._thread.stage.connect(self._on_asr_stage)
-        self._thread.cancelled.connect(self._on_task_cancelled)
-        self._thread.failed.connect(self._on_worker_failed)
-        self._thread.finished.connect(self._thread.deleteLater)
-        self._thread.start()
+        self._subtitle_thread = thread
+        thread.succeeded.connect(self._on_asr_fallback_finished)
+        thread.progress.connect(self._on_asr_progress)
+        thread.stage.connect(self._on_asr_stage)
+        thread.cancelled.connect(self._on_task_cancelled)
+        thread.failed.connect(self._on_worker_failed)
+        thread.finished.connect(lambda: self._finish_subtitle_thread(thread))
+        thread.start()
         self._persist_workspace_state()
 
     def _on_asr_progress(
@@ -4206,6 +4365,13 @@ class MainWindow(QMainWindow):
             self._matching_page.set_status(f"匹配任务失败：{message}")
         self._set_busy(False, scope="matching")
         QMessageBox.critical(self, "匹配失败", message)
+
+    def _on_cover_worker_failed(self, message: str) -> None:
+        self._cover_control = None
+        self._cover_page.pause_button.setText("暂停")
+        self._cover_page.set_status(f"封面任务失败：{message}")
+        self._set_busy(False, scope="cover")
+        QMessageBox.critical(self, "封面处理失败", message)
 
     def _on_worker_failed(self, message: str) -> None:
         self._task_control = None
